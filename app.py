@@ -30,13 +30,28 @@ MODEL = "openai/gpt-oss-20b"
 
 
 # =========================================================
+# SESSION STATE
+# =========================================================
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "file_name" not in st.session_state:
+    st.session_state.file_name = None
+
+if "df" not in st.session_state:
+    st.session_state.df = None
+
+
+# =========================================================
 # FILE UPLOAD
 # =========================================================
 
 uploaded_file = st.file_uploader(
-    "Upload a CSV or Excel file",
+    "Upload CSV or Excel file",
     type=["csv", "xlsx", "xls"]
 )
+
 
 if uploaded_file is None:
 
@@ -46,22 +61,33 @@ if uploaded_file is None:
 
 
 # =========================================================
-# READ FILE
+# READ NEW FILE
 # =========================================================
 
-try:
+if st.session_state.file_name != uploaded_file.name:
 
-    if uploaded_file.name.lower().endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
+    try:
 
-    else:
-        df = pd.read_excel(uploaded_file)
+        if uploaded_file.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
 
-except Exception as e:
+        else:
+            df = pd.read_excel(uploaded_file)
 
-    st.error(f"Could not read the file: {e}")
+        st.session_state.df = df
+        st.session_state.file_name = uploaded_file.name
 
-    st.stop()
+        # New file = new conversation
+        st.session_state.messages = []
+
+    except Exception as e:
+
+        st.error(f"Could not read file: {e}")
+
+        st.stop()
+
+
+df = st.session_state.df
 
 
 # =========================================================
@@ -69,13 +95,13 @@ except Exception as e:
 # =========================================================
 
 st.success(
-    f"Loaded: {uploaded_file.name} "
+    f"Loaded: {st.session_state.file_name} "
     f"({len(df):,} rows × {len(df.columns):,} columns)"
 )
 
 
 # =========================================================
-# PREVIEW
+# DATA PREVIEW
 # =========================================================
 
 with st.expander("📄 Preview uploaded data"):
@@ -114,44 +140,88 @@ schema_text = "\n".join(
 
 def generate_sql(question):
 
+    # ---------------------------------------------
+    # Build conversation context
+    # ---------------------------------------------
+
+    conversation_text = ""
+
+    for message in st.session_state.messages:
+
+        if message["role"] == "user":
+
+            conversation_text += (
+                f"\nUSER:\n{message['content']}\n"
+            )
+
+        elif message["role"] == "assistant":
+
+            if "sql" in message:
+
+                conversation_text += (
+                    f"\nASSISTANT SQL:\n"
+                    f"{message['sql']}\n"
+                )
+
+
+    # ---------------------------------------------
+    # System prompt
+    # ---------------------------------------------
+
     system_prompt = f"""
 You are an expert data analyst.
 
-The user has uploaded a dataset.
+You answer questions about a dataset using DuckDB SQL.
 
-The DuckDB table name is:
+TABLE:
 
 uploaded_data
 
-The dataset has these columns:
+SCHEMA:
 
 {schema_text}
 
-Your task is to convert the user's natural language
-question into ONE DuckDB SQL query.
+CONVERSATION HISTORY:
+
+{conversation_text}
+
+CURRENT USER QUESTION:
+
+{question}
 
 IMPORTANT RULES:
 
-1. Generate ONLY SELECT or WITH queries.
-2. Never modify the data.
-3. Never use INSERT.
-4. Never use UPDATE.
-5. Never use DELETE.
-6. Never use DROP.
-7. Never use ALTER.
-8. Never use CREATE.
-9. Never use TRUNCATE.
-10. Use ONLY columns that exist in the dataset.
-11. The table name is uploaded_data.
-12. Use valid DuckDB SQL.
-13. Return ONLY the SQL query.
-14. Do not use markdown code fences.
+1. Generate exactly ONE SQL query.
+2. Only generate SELECT or WITH queries.
+3. Never modify the dataset.
+4. Never use INSERT.
+5. Never use UPDATE.
+6. Never use DELETE.
+7. Never use DROP.
+8. Never use ALTER.
+9. Never use CREATE.
+10. Never use TRUNCATE.
+11. Never use MERGE.
+12. Never use REPLACE.
+13. Use only columns that exist in the schema.
+14. The table name is uploaded_data.
+15. Use valid DuckDB SQL.
+16. Understand follow-up questions using the conversation history.
+17. If the user says things like "those", "them", "same",
+    "only India", etc., resolve the meaning using the
+    previous conversation.
+18. Return ONLY SQL.
+19. Do not use markdown code fences.
 
-If the question cannot be answered using the dataset,
-return:
+If the question cannot be answered from the dataset,
+return exactly:
 
 CANNOT_ANSWER
 """
+
+    # ---------------------------------------------
+    # Ask Groq
+    # ---------------------------------------------
 
     response = client.chat.completions.create(
 
@@ -171,18 +241,15 @@ CANNOT_ANSWER
         temperature=0
     )
 
-    sql = response.choices[0].message.content.strip()
-
-    return sql
+    return response.choices[0].message.content.strip()
 
 
 # =========================================================
-# SQL VALIDATION
+# VALIDATE SQL
 # =========================================================
 
 def validate_sql(sql):
 
-    # Remove markdown if the model accidentally adds it
     sql = re.sub(
         r"```sql",
         "",
@@ -195,14 +262,13 @@ def validate_sql(sql):
     if sql == "CANNOT_ANSWER":
         return None
 
-    # Must start with SELECT or WITH
     if not re.match(
         r"^(SELECT|WITH)\b",
         sql,
-        re.IGNORECASE
+        flags=re.IGNORECASE
     ):
         raise ValueError(
-            "Generated SQL is not a SELECT query."
+            "Only SELECT queries are allowed."
         )
 
     forbidden_words = [
@@ -222,14 +288,50 @@ def validate_sql(sql):
         if re.search(
             rf"\b{word}\b",
             sql,
-            re.IGNORECASE
+            flags=re.IGNORECASE
         ):
-
             raise ValueError(
                 f"Unsafe SQL detected: {word}"
             )
 
     return sql
+
+
+# =========================================================
+# DISPLAY PREVIOUS CONVERSATION
+# =========================================================
+
+for message in st.session_state.messages:
+
+    with st.chat_message(message["role"]):
+
+        if message["role"] == "user":
+
+            st.write(message["content"])
+
+        elif message["role"] == "assistant":
+
+            if "sql" in message:
+
+                st.write("**Generated SQL**")
+
+                st.code(
+                    message["sql"],
+                    language="sql"
+                )
+
+            if "data" in message:
+
+                st.write("**Result**")
+
+                st.dataframe(
+                    message["data"],
+                    use_container_width=True
+                )
+
+            if "error" in message:
+
+                st.error(message["error"])
 
 
 # =========================================================
@@ -247,18 +349,25 @@ question = st.chat_input(
 
 if question:
 
-    # -----------------------------------------------------
-    # Show question
-    # -----------------------------------------------------
+    # ---------------------------------------------
+    # Save user message
+    # ---------------------------------------------
+
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": question
+        }
+    )
 
     with st.chat_message("user"):
 
         st.write(question)
 
 
-    # -----------------------------------------------------
-    # Generate and execute SQL
-    # -----------------------------------------------------
+    # ---------------------------------------------
+    # Assistant
+    # ---------------------------------------------
 
     with st.chat_message("assistant"):
 
@@ -273,28 +382,37 @@ if question:
 
             if sql is None:
 
-                st.warning(
-                    "I can't answer that question "
-                    "using the uploaded data."
+                answer = (
+                    "I can't answer that using "
+                    "the uploaded dataset."
+                )
+
+                st.warning(answer)
+
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "error": answer
+                    }
                 )
 
                 st.stop()
 
 
-            # -------------------------------------------------
+            # -----------------------------------------
             # Execute SQL
-            # -------------------------------------------------
+            # -----------------------------------------
 
             with st.spinner("Running query..."):
 
                 result = conn.execute(sql).df()
 
 
-            # -------------------------------------------------
-            # Show SQL
-            # -------------------------------------------------
+            # -----------------------------------------
+            # Display SQL
+            # -----------------------------------------
 
-            st.subheader("Generated SQL")
+            st.write("### Generated SQL")
 
             st.code(
                 sql,
@@ -302,11 +420,11 @@ if question:
             )
 
 
-            # -------------------------------------------------
-            # Show result
-            # -------------------------------------------------
+            # -----------------------------------------
+            # Display result
+            # -----------------------------------------
 
-            st.subheader("Result")
+            st.write("### Result")
 
             if result.empty:
 
@@ -323,8 +441,28 @@ if question:
                 )
 
 
+            # -----------------------------------------
+            # Save assistant message
+            # -----------------------------------------
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "sql": sql,
+                    "data": result
+                }
+            )
+
+
         except Exception as e:
 
             st.error(
                 f"Something went wrong: {e}"
+            )
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "error": str(e)
+                }
             )
