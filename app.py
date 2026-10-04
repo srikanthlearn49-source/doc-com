@@ -202,8 +202,14 @@ RULES:
 16. Understand follow-up questions using conversation history.
 17. Resolve words like "those", "them", "same",
     "India", "USA", etc. using previous context.
-18. Return ONLY SQL.
-19. Do not use markdown.
+18. When comparing text values, make comparisons
+    case-insensitive whenever appropriate.
+    Prefer LOWER(column) = LOWER('value') instead of
+    column = 'value'.
+19. Do not assume the capitalization used by the user
+    exactly matches the capitalization in the dataset.
+20. Return ONLY SQL.
+21. Do not use markdown.
 
 If the question cannot be answered using the dataset,
 return:
