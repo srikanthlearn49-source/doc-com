@@ -6,7 +6,6 @@ import re
 import altair as alt
 
 
-
 # =========================================================
 # PAGE
 # =========================================================
@@ -42,8 +41,11 @@ if "messages" not in st.session_state:
 if "file_name" not in st.session_state:
     st.session_state.file_name = None
 
-if "df" not in st.session_state:
-    st.session_state.df = None
+if "sheets" not in st.session_state:
+    st.session_state.sheets = {}
+
+if "table_names" not in st.session_state:
+    st.session_state.table_names = {}
 
 
 # =========================================================
@@ -58,9 +60,48 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is None:
 
-    st.info("Upload a CSV or Excel file to get started.")
+    st.info(
+        "Upload a CSV or Excel file to get started."
+    )
 
     st.stop()
+
+
+# =========================================================
+# HELPER - SAFE TABLE NAME
+# =========================================================
+
+def make_safe_table_name(name, used_names=None):
+
+    if used_names is None:
+        used_names = set()
+
+    table_name = re.sub(
+        r"[^a-zA-Z0-9_]",
+        "_",
+        str(name)
+    ).lower()
+
+    table_name = table_name.strip("_")
+
+    if not table_name:
+        table_name = "uploaded_data"
+
+    if table_name[0].isdigit():
+        table_name = f"table_{table_name}"
+
+    original_name = table_name
+    counter = 2
+
+    while table_name in used_names:
+
+        table_name = (
+            f"{original_name}_{counter}"
+        )
+
+        counter += 1
+
+    return table_name
 
 
 # =========================================================
@@ -71,69 +112,222 @@ if st.session_state.file_name != uploaded_file.name:
 
     try:
 
+        sheets = {}
+        table_names = {}
+        used_table_names = set()
+
+        # =================================================
+        # CSV
+        # =================================================
+
         if uploaded_file.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
+
+            df = pd.read_csv(
+                uploaded_file
+            )
+
+            table_name = make_safe_table_name(
+                "uploaded_data",
+                used_table_names
+            )
+
+            sheets[table_name] = df
+
+            table_names["uploaded_data"] = table_name
+
+            used_table_names.add(
+                table_name
+            )
+
+
+        # =================================================
+        # EXCEL
+        # =================================================
 
         else:
-            df = pd.read_excel(uploaded_file)
 
-        st.session_state.df = df
-        st.session_state.file_name = uploaded_file.name
+            excel_file = pd.ExcelFile(
+                uploaded_file
+            )
 
-        # Reset chat for a new file
+            for sheet_name in excel_file.sheet_names:
+
+                sheet_df = pd.read_excel(
+                    uploaded_file,
+                    sheet_name=sheet_name
+                )
+
+                # Skip completely empty sheets
+                if sheet_df.empty:
+                    continue
+
+                table_name = make_safe_table_name(
+                    sheet_name,
+                    used_table_names
+                )
+
+                sheets[table_name] = sheet_df
+
+                table_names[sheet_name] = table_name
+
+                used_table_names.add(
+                    table_name
+                )
+
+
+        if not sheets:
+
+            st.error(
+                "The uploaded file does not contain "
+                "any usable data."
+            )
+
+            st.stop()
+
+
+        # =================================================
+        # SAVE FILE DATA IN SESSION
+        # =================================================
+
+        st.session_state.sheets = sheets
+
+        st.session_state.table_names = table_names
+
+        st.session_state.file_name = (
+            uploaded_file.name
+        )
+
+        # New file = new conversation
         st.session_state.messages = []
+
 
     except Exception as e:
 
-        st.error(f"Could not read file: {e}")
+        st.error(
+            f"Could not read file: {e}"
+        )
 
         st.stop()
-
-
-df = st.session_state.df
 
 
 # =========================================================
 # FILE INFORMATION
 # =========================================================
 
-st.success(
-    f"Loaded: {st.session_state.file_name} "
-    f"({len(df):,} rows × {len(df.columns):,} columns)"
-)
+if len(st.session_state.sheets) == 1:
+
+    only_table_name = next(
+        iter(st.session_state.sheets)
+    )
+
+    only_df = (
+        st.session_state.sheets[
+            only_table_name
+        ]
+    )
+
+    st.success(
+        f"Loaded: {st.session_state.file_name} "
+        f"({len(only_df):,} rows × "
+        f"{len(only_df.columns):,} columns)"
+    )
+
+else:
+
+    total_rows = sum(
+        len(df)
+        for df in st.session_state.sheets.values()
+    )
+
+    st.success(
+        f"Loaded: {st.session_state.file_name} "
+        f"({len(st.session_state.sheets)} "
+        f"tables/sheets, "
+        f"{total_rows:,} total rows)"
+    )
 
 
 # =========================================================
 # DATA PREVIEW
 # =========================================================
 
-with st.expander("📄 Preview uploaded data"):
+with st.expander(
+    "📄 Preview uploaded data"
+):
 
-    st.dataframe(
-        df.head(100),
-        use_container_width=True
-    )
+    for table_name, df in (
+        st.session_state.sheets.items()
+    ):
+
+        st.markdown(
+            f"### `{table_name}`"
+        )
+
+        st.caption(
+            f"{len(df):,} rows × "
+            f"{len(df.columns):,} columns"
+        )
+
+        st.dataframe(
+            df.head(20),
+            use_container_width=True
+        )
 
 
 # =========================================================
 # DUCKDB
 # =========================================================
 
-conn = duckdb.connect(":memory:")
-
-conn.register(
-    "uploaded_data",
-    df
+conn = duckdb.connect(
+    ":memory:"
 )
 
 
+for table_name, df in (
+    st.session_state.sheets.items()
+):
+
+    conn.register(
+        table_name,
+        df
+    )
+
+
 # =========================================================
-# SCHEMA
+# DATABASE SCHEMA
 # =========================================================
 
+schema_parts = []
+
+for table_name, df in (
+    st.session_state.sheets.items()
+):
+
+    column_lines = []
+
+    for column in df.columns:
+
+        column_lines.append(
+            f"  - {column}: "
+            f"{df[column].dtype}"
+        )
+
+    columns_text = "\n".join(
+        column_lines
+    )
+
+    schema_parts.append(
+        f"""
+TABLE: {table_name}
+
+Columns:
+{columns_text}
+"""
+    )
+
+
 schema_text = "\n".join(
-    f"- {column}: {df[column].dtype}"
-    for column in df.columns
+    schema_parts
 )
 
 
@@ -150,7 +344,8 @@ def generate_sql(question):
         if message["role"] == "user":
 
             conversation_text += (
-                f"\nUSER:\n{message['content']}\n"
+                f"\nUSER:\n"
+                f"{message['content']}\n"
             )
 
         elif message["role"] == "assistant":
@@ -158,7 +353,7 @@ def generate_sql(question):
             if "sql" in message:
 
                 conversation_text += (
-                    f"\nASSISTANT SQL:\n"
+                    "\nASSISTANT SQL:\n"
                     f"{message['sql']}\n"
                 )
 
@@ -166,13 +361,10 @@ def generate_sql(question):
     system_prompt = f"""
 You are an expert data analyst.
 
-You answer questions about a dataset using DuckDB SQL.
+You answer questions about uploaded datasets
+using DuckDB SQL.
 
-TABLE:
-
-uploaded_data
-
-SCHEMA:
+AVAILABLE DATABASE TABLES:
 
 {schema_text}
 
@@ -187,40 +379,98 @@ CURRENT QUESTION:
 RULES:
 
 1. Generate exactly ONE SQL query.
-2. Only generate SELECT or WITH queries.
-3. Never modify the dataset.
-4. Never use INSERT.
-5. Never use UPDATE.
-6. Never use DELETE.
-7. Never use DROP.
-8. Never use ALTER.
-9. Never use CREATE.
-10. Never use TRUNCATE.
-11. Never use MERGE.
-12. Never use REPLACE.
-13. Use only columns that exist in the schema.
-14. The table name is uploaded_data.
-15. Use valid DuckDB SQL.
-16. Understand follow-up questions using conversation history.
-17. Resolve words like "those", "them", "same",
-    "India", "USA", etc. using previous context.
-18. When comparing text values, make comparisons
-    case-insensitive whenever appropriate.
-    Prefer LOWER(column) = LOWER('value') instead of
-    column = 'value'.
-19. Do not assume the capitalization used by the user
-    exactly matches the capitalization in the dataset.
-20. If a text value is being filtered, use the actual
-    dataset value when possible. Case-insensitive matching
-    is preferred.
-21. Return ONLY SQL.
-22. Do not use markdown.
 
-If the question cannot be answered using the dataset,
-return:
+2. Only generate SELECT or WITH queries.
+
+3. Never modify any dataset.
+
+4. Never use INSERT.
+
+5. Never use UPDATE.
+
+6. Never use DELETE.
+
+7. Never use DROP.
+
+8. Never use ALTER.
+
+9. Never use CREATE.
+
+10. Never use TRUNCATE.
+
+11. Never use MERGE.
+
+12. Never use REPLACE.
+
+13. Never use GRANT.
+
+14. Never use REVOKE.
+
+15. Never use ATTACH.
+
+16. Never use DETACH.
+
+17. Never use COPY.
+
+18. Never use EXPORT.
+
+19. Never use IMPORT.
+
+20. Use only tables and columns that
+    exist in the provided schema.
+
+21. You may query one or more tables.
+
+22. Use JOINs when the question requires
+    combining multiple tables.
+
+23. Understand follow-up questions using
+    conversation history.
+
+24. Resolve words such as:
+    "those", "them", "same", "that",
+    "previous", "above", etc. using
+    conversation history.
+
+25. When comparing text values, prefer
+    case-insensitive comparisons using
+    LOWER().
+
+    Example:
+
+    LOWER(Category) = LOWER('books')
+
+26. Do not assume the capitalization used
+    by the user exactly matches the data.
+
+27. When the user asks for a ranking such as
+    "top 5", use ORDER BY and LIMIT.
+
+28. When calculating totals, use appropriate
+    aggregation such as SUM().
+
+29. When calculating averages, use AVG().
+
+30. When counting records, use COUNT().
+
+31. When grouping data, use GROUP BY.
+
+32. Do not invent columns.
+
+33. Do not invent tables.
+
+34. Use valid DuckDB SQL.
+
+35. Return ONLY SQL.
+
+36. Do not use markdown code fences.
+
+If the question cannot be answered using
+the uploaded data, return:
 
 CANNOT_ANSWER
 """
+
 
     response = client.chat.completions.create(
 
@@ -240,13 +490,24 @@ CANNOT_ANSWER
         temperature=0
     )
 
-    return response.choices[0].message.content.strip()
+
+    return (
+        response
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
+
 
 # =========================================================
 # VALIDATE SQL
 # =========================================================
 
 def validate_sql(sql):
+
+    if sql is None:
+        return None
 
     sql = re.sub(
         r"```sql",
@@ -255,14 +516,20 @@ def validate_sql(sql):
         flags=re.IGNORECASE
     )
 
-    sql = sql.replace("```", "").strip()
+    sql = re.sub(
+        r"```",
+        "",
+        sql
+    ).strip()
 
-    if sql == "CANNOT_ANSWER":
+
+    if sql.upper() == "CANNOT_ANSWER":
         return None
 
-    # -----------------------------------------------------
-    # Only one SQL statement
-    # -----------------------------------------------------
+
+    # =====================================================
+    # ONLY ONE SQL STATEMENT
+    # =====================================================
 
     statements = [
         statement.strip()
@@ -270,17 +537,20 @@ def validate_sql(sql):
         if statement.strip()
     ]
 
+
     if len(statements) != 1:
 
         raise ValueError(
             "Only one SQL statement is allowed."
         )
 
+
     sql = statements[0]
 
-    # -----------------------------------------------------
-    # Only SELECT / WITH
-    # -----------------------------------------------------
+
+    # =====================================================
+    # ONLY SELECT / WITH
+    # =====================================================
 
     if not re.match(
         r"^(SELECT|WITH)\b",
@@ -289,12 +559,14 @@ def validate_sql(sql):
     ):
 
         raise ValueError(
-            "Only SELECT or WITH queries are allowed."
+            "Only SELECT or WITH queries "
+            "are allowed."
         )
 
-    # -----------------------------------------------------
-    # Forbidden SQL
-    # -----------------------------------------------------
+
+    # =====================================================
+    # FORBIDDEN SQL
+    # =====================================================
 
     forbidden_words = [
         "INSERT",
@@ -315,6 +587,7 @@ def validate_sql(sql):
         "IMPORT"
     ]
 
+
     for word in forbidden_words:
 
         if re.search(
@@ -327,13 +600,19 @@ def validate_sql(sql):
                 f"Unsafe SQL detected: {word}"
             )
 
+
     return sql
+
 
 # =========================================================
 # FIX SQL
 # =========================================================
 
-def fix_sql(question, bad_sql, error_message):
+def fix_sql(
+    question,
+    bad_sql,
+    error_message
+):
 
     prompt = f"""
 You are an expert DuckDB SQL debugger.
@@ -350,7 +629,7 @@ DuckDB returned this error:
 
 {error_message}
 
-The dataset schema is:
+AVAILABLE DATABASE TABLES:
 
 {schema_text}
 
@@ -359,24 +638,60 @@ Fix the SQL query.
 RULES:
 
 1. Return exactly ONE SQL query.
+
 2. Only generate SELECT or WITH queries.
+
 3. Never use INSERT.
+
 4. Never use UPDATE.
+
 5. Never use DELETE.
+
 6. Never use DROP.
+
 7. Never use ALTER.
+
 8. Never use CREATE.
+
 9. Never use TRUNCATE.
+
 10. Never use MERGE.
+
 11. Never use REPLACE.
-12. Use only columns that exist in the schema.
-13. The table name is uploaded_data.
-14. Use valid DuckDB SQL.
-15. If comparing text values, prefer case-insensitive
+
+12. Never use GRANT.
+
+13. Never use REVOKE.
+
+14. Never use ATTACH.
+
+15. Never use DETACH.
+
+16. Never use COPY.
+
+17. Never use EXPORT.
+
+18. Never use IMPORT.
+
+19. Use only tables and columns
+    that exist in the schema.
+
+20. You may use JOINs when required.
+
+21. Use valid DuckDB SQL.
+
+22. Prefer case-insensitive text
     comparisons using LOWER().
-16. Return ONLY the corrected SQL.
-17. Do not use markdown code fences.
+
+23. Do not invent columns.
+
+24. Do not invent tables.
+
+25. Return ONLY the corrected SQL.
+
+26. Do not use markdown code fences.
 """
+
 
     response = client.chat.completions.create(
 
@@ -392,21 +707,37 @@ RULES:
         temperature=0
     )
 
-    corrected_sql = response.choices[0].message.content.strip()
 
-    return validate_sql(corrected_sql)
+    corrected_sql = (
+        response
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
+
+
+    return validate_sql(
+        corrected_sql
+    )
 
 
 # =========================================================
 # GENERATE NATURAL LANGUAGE ANSWER
 # =========================================================
 
-def generate_answer(question, sql, result):
+def generate_answer(
+    question,
+    sql,
+    result
+):
 
-    # Limit result sent back to LLM
-    result_for_llm = result.head(100).to_string(
-        index=False
+    result_for_llm = (
+        result
+        .head(100)
+        .to_string(index=False)
     )
+
 
     prompt = f"""
 You are a helpful data analyst.
@@ -423,17 +754,32 @@ The query returned:
 
 {result_for_llm}
 
-Answer the user's question using the query result.
+Answer the user's question using
+ONLY the query result.
 
-Rules:
+RULES:
 
 1. Be concise and clear.
-2. Mention the important numbers.
+
+2. Mention important numbers.
+
 3. Do not invent information.
-4. Do not claim anything that isn't supported by the result.
-5. If there are multiple rows, summarize the important pattern.
-6. Do not show SQL in your answer.
+
+4. Do not claim anything that isn't
+   supported by the result.
+
+5. If there are multiple rows,
+   summarize the important pattern.
+
+6. Do not show SQL.
+
+7. Do not mention internal implementation
+   details.
+
+8. Do not say you looked at data that
+   isn't present in the result.
 """
+
 
     response = client.chat.completions.create(
 
@@ -449,7 +795,15 @@ Rules:
         temperature=0
     )
 
-    return response.choices[0].message.content.strip()
+
+    return (
+        response
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
+
 
 # =========================================================
 # EXPLICIT CHART REQUEST
@@ -459,20 +813,43 @@ def get_requested_chart(question):
 
     q = question.lower()
 
-    if "pie chart" in q or "pie graph" in q:
+
+    if (
+        "pie chart" in q
+        or "pie graph" in q
+    ):
         return "pie"
 
-    if "donut chart" in q or "doughnut chart" in q:
+
+    if (
+        "donut chart" in q
+        or "doughnut chart" in q
+    ):
         return "donut"
 
-    if "bar chart" in q or "bar graph" in q:
+
+    if (
+        "bar chart" in q
+        or "bar graph" in q
+        or "column chart" in q
+        or "column graph" in q
+    ):
         return "bar"
 
-    if "line chart" in q or "line graph" in q:
+
+    if (
+        "line chart" in q
+        or "line graph" in q
+    ):
         return "line"
 
-    if "area chart" in q or "area graph" in q:
+
+    if (
+        "area chart" in q
+        or "area graph" in q
+    ):
         return "area"
+
 
     if (
         "scatter plot" in q
@@ -481,143 +858,198 @@ def get_requested_chart(question):
     ):
         return "scatter"
 
+
     return None
+
+
+# =========================================================
+# DETECT DATE-LIKE COLUMN
+# =========================================================
+
+def is_date_like(series):
+
+    if pd.api.types.is_datetime64_any_dtype(
+        series
+    ):
+        return True
+
+    if not (
+        pd.api.types.is_object_dtype(series)
+        or pd.api.types.is_string_dtype(series)
+    ):
+        return False
+
+    if len(series) == 0:
+        return False
+
+    sample = (
+        series
+        .dropna()
+        .astype(str)
+        .head(50)
+    )
+
+    if sample.empty:
+        return False
+
+    converted = pd.to_datetime(
+        sample,
+        errors="coerce"
+    )
+
+    success_rate = (
+        converted.notna().mean()
+    )
+
+    return success_rate >= 0.8
 
 
 # =========================================================
 # CHART TYPE DETECTION
 # =========================================================
 
-def detect_chart_type(question, result):
+def detect_chart_type(
+    question,
+    result
+):
 
     if result.empty:
         return None
 
+
     # User explicitly requested a chart
-    requested_chart = get_requested_chart(question)
+    requested_chart = get_requested_chart(
+        question
+    )
 
     if requested_chart:
         return requested_chart
 
+
     if len(result.columns) < 2:
         return None
+
+
+    # Automatic charts work best with
+    # exactly two useful columns
+    if len(result.columns) != 2:
+        return None
+
 
     question_lower = question.lower()
 
 
-    # -----------------------------------------------------
-    # Explicit chart requests
-    # -----------------------------------------------------
-
-    if "pie chart" in question_lower:
-        return "pie"
-
-    if "donut chart" in question_lower:
-        return "donut"
-
-    if "bar chart" in question_lower:
-        return "bar"
-
-    if "column chart" in question_lower:
-        return "bar"
-
-    if "line chart" in question_lower:
-        return "line"
-
-    if "area chart" in question_lower:
-        return "area"
-
-    if "scatter plot" in question_lower:
-        return "scatter"
-
-    if "scatter chart" in question_lower:
-        return "scatter"
-
-    # -----------------------------------------------------
-    # Automatic chart selection
-    # -----------------------------------------------------
-
-    if len(result.columns) != 2:
-        return None
-
     first_column = result.columns[0]
     second_column = result.columns[1]
 
-    first_series = result[first_column]
-    second_series = result[second_column]
 
-    first_is_numeric = pd.api.types.is_numeric_dtype(
-        first_series
+    first_series = result[
+        first_column
+    ]
+
+    second_series = result[
+        second_column
+    ]
+
+
+    first_is_numeric = (
+        pd.api.types.is_numeric_dtype(
+            first_series
+        )
     )
 
-    second_is_numeric = pd.api.types.is_numeric_dtype(
-        second_series
+
+    second_is_numeric = (
+        pd.api.types.is_numeric_dtype(
+            second_series
+        )
     )
 
-    # -----------------------------------------------------
-    # Numeric vs numeric → scatter
-    # -----------------------------------------------------
 
-    if first_is_numeric and second_is_numeric:
+    # =====================================================
+    # DATE/TIME + NUMERIC → LINE
+    # =====================================================
 
-        if any(word in question_lower for word in [
-            "relationship",
-            "correlation",
-            "vs",
-            "versus",
-            "compare"
-        ]):
-
-            return "scatter"
-
-    # -----------------------------------------------------
-    # Date/time result → line
-    # -----------------------------------------------------
-
-    if pd.api.types.is_datetime64_any_dtype(
-        result[first_series]
+    if (
+        is_date_like(first_series)
+        and second_is_numeric
     ):
 
         return "line"
 
-    # -----------------------------------------------------
-    # Text + number
-    # -----------------------------------------------------
 
-    if not first_is_numeric and second_is_numeric:
+    # =====================================================
+    # NUMERIC + NUMERIC → SCATTER
+    # =====================================================
 
-        # Time-related questions → line
-        if any(word in question_lower for word in [
-            "monthly",
-            "month",
-            "weekly",
-            "week",
-            "daily",
-            "day",
-            "yearly",
-            "year",
-            "over time",
-            "trend",
-            "growth"
-        ]):
+    if (
+        first_is_numeric
+        and second_is_numeric
+    ):
+
+        if any(
+            word in question_lower
+            for word in [
+                "relationship",
+                "correlation",
+                "versus",
+                " vs ",
+                "compare"
+            ]
+        ):
+
+            return "scatter"
+
+
+    # =====================================================
+    # CATEGORY + NUMERIC
+    # =====================================================
+
+    if (
+        not first_is_numeric
+        and second_is_numeric
+    ):
+
+        # Time/trend questions
+        if any(
+            word in question_lower
+            for word in [
+                "monthly",
+                "month",
+                "weekly",
+                "week",
+                "daily",
+                "day",
+                "yearly",
+                "year",
+                "over time",
+                "trend",
+                "growth"
+            ]
+        ):
 
             return "line"
 
-        # Small number of categories → pie
-        if len(result) <= 6:
 
-            if any(word in question_lower for word in [
+        # Share/distribution
+        if any(
+            word in question_lower
+            for word in [
                 "share",
                 "percentage",
                 "percent",
                 "proportion",
                 "distribution"
-            ]):
+            ]
+        ):
 
+            if len(result) <= 8:
                 return "pie"
 
-        # Default categorical result → bar
+
+        # Ranking/comparison
         return "bar"
+
 
     return None
 
@@ -626,32 +1058,45 @@ def detect_chart_type(question, result):
 # SHOW CHART
 # =========================================================
 
-def show_chart(question, result):
+def show_chart(
+    question,
+    result
+):
 
     chart_type = detect_chart_type(
         question,
         result
     )
 
+
     if chart_type is None:
         return
+
 
     if result.empty:
         return
 
+
     if len(result.columns) < 2:
         return
 
-    # Keep charts readable
+
     if len(result) > 30:
+        st.info(
+            "The result contains too many "
+            "categories for a readable chart."
+        )
         return
+
 
     x_column = result.columns[0]
     y_column = result.columns[1]
 
+
     chart_data = result[
         [x_column, y_column]
     ].copy()
+
 
     # =====================================================
     # PIE
@@ -659,31 +1104,39 @@ def show_chart(question, result):
 
     if chart_type == "pie":
 
-        chart = alt.Chart(chart_data).mark_arc().encode(
+        chart = (
+            alt.Chart(chart_data)
+            .mark_arc()
+            .encode(
 
-            theta=alt.Theta(
-                field=y_column,
-                type="quantitative"
-            ),
+                theta=alt.Theta(
+                    field=y_column,
+                    type="quantitative"
+                ),
 
-            color=alt.Color(
-                field=x_column,
-                type="nominal",
-                title=x_column
-            ),
+                color=alt.Color(
+                    field=x_column,
+                    type="nominal",
+                    title=x_column
+                ),
 
-            tooltip=[
-                x_column,
-                y_column
-            ]
-        ).properties(
-            height=450
+                tooltip=[
+                    x_column,
+                    y_column
+                ]
+            )
+            .properties(
+                height=450,
+                title="Share of Total"
+            )
         )
+
 
         st.altair_chart(
             chart,
             use_container_width=True
         )
+
 
     # =====================================================
     # DONUT
@@ -691,32 +1144,41 @@ def show_chart(question, result):
 
     elif chart_type == "donut":
 
-        chart = alt.Chart(chart_data).mark_arc(
-            innerRadius=80
-        ).encode(
+        chart = (
+            alt.Chart(chart_data)
+            .mark_arc(
+                innerRadius=80
+            )
+            .encode(
 
-            theta=alt.Theta(
-                field=y_column,
-                type="quantitative"
-            ),
+                theta=alt.Theta(
+                    field=y_column,
+                    type="quantitative"
+                ),
 
-            color=alt.Color(
-                field=x_column,
-                type="nominal"
-            ),
+                color=alt.Color(
+                    field=x_column,
+                    type="nominal",
+                    title=x_column
+                ),
 
-            tooltip=[
-                x_column,
-                y_column
-            ]
-        ).properties(
-            height=450
+                tooltip=[
+                    x_column,
+                    y_column
+                ]
+            )
+            .properties(
+                height=450,
+                title="Share of Total"
+            )
         )
+
 
         st.altair_chart(
             chart,
             use_container_width=True
         )
+
 
     # =====================================================
     # BAR
@@ -724,31 +1186,38 @@ def show_chart(question, result):
 
     elif chart_type == "bar":
 
-        chart = alt.Chart(chart_data).mark_bar().encode(
+        chart = (
+            alt.Chart(chart_data)
+            .mark_bar()
+            .encode(
 
-            x=alt.X(
-                f"{x_column}:N",
-                sort="-y",
-                title=x_column
-            ),
+                x=alt.X(
+                    f"{x_column}:N",
+                    sort="-y",
+                    title=x_column
+                ),
 
-            y=alt.Y(
-                f"{y_column}:Q",
-                title=y_column
-            ),
+                y=alt.Y(
+                    f"{y_column}:Q",
+                    title=y_column
+                ),
 
-            tooltip=[
-                x_column,
-                y_column
-            ]
-        ).properties(
-            height=450
+                tooltip=[
+                    x_column,
+                    y_column
+                ]
+            )
+            .properties(
+                height=450
+            )
         )
+
 
         st.altair_chart(
             chart,
             use_container_width=True
         )
+
 
     # =====================================================
     # LINE
@@ -756,32 +1225,60 @@ def show_chart(question, result):
 
     elif chart_type == "line":
 
-        chart = alt.Chart(chart_data).mark_line(
-            point=True
-        ).encode(
+        line_data = chart_data.copy()
 
-            x=alt.X(
-                f"{x_column}:T",
-                title=x_column
-            ),
 
-            y=alt.Y(
-                f"{y_column}:Q",
-                title=y_column
-            ),
+        # Convert date-like first column
+        # to actual datetime for Altair
+        if not pd.api.types.is_datetime64_any_dtype(
+            line_data[x_column]
+        ):
 
-            tooltip=[
-                x_column,
-                y_column
-            ]
-        ).properties(
-            height=450
+            converted_dates = pd.to_datetime(
+                line_data[x_column],
+                errors="coerce"
+            )
+
+            if converted_dates.notna().all():
+
+                line_data[x_column] = (
+                    converted_dates
+                )
+
+
+        chart = (
+            alt.Chart(line_data)
+            .mark_line(
+                point=True
+            )
+            .encode(
+
+                x=alt.X(
+                    f"{x_column}:T",
+                    title=x_column
+                ),
+
+                y=alt.Y(
+                    f"{y_column}:Q",
+                    title=y_column
+                ),
+
+                tooltip=[
+                    x_column,
+                    y_column
+                ]
+            )
+            .properties(
+                height=450
+            )
         )
+
 
         st.altair_chart(
             chart,
             use_container_width=True
         )
+
 
     # =====================================================
     # AREA
@@ -789,32 +1286,58 @@ def show_chart(question, result):
 
     elif chart_type == "area":
 
-        chart = alt.Chart(chart_data).mark_area(
-            line=True
-        ).encode(
+        area_data = chart_data.copy()
 
-            x=alt.X(
-                f"{x_column}:T",
-                title=x_column
-            ),
 
-            y=alt.Y(
-                f"{y_column}:Q",
-                title=y_column
-            ),
+        if not pd.api.types.is_datetime64_any_dtype(
+            area_data[x_column]
+        ):
 
-            tooltip=[
-                x_column,
-                y_column
-            ]
-        ).properties(
-            height=450
+            converted_dates = pd.to_datetime(
+                area_data[x_column],
+                errors="coerce"
+            )
+
+            if converted_dates.notna().all():
+
+                area_data[x_column] = (
+                    converted_dates
+                )
+
+
+        chart = (
+            alt.Chart(area_data)
+            .mark_area(
+                line=True
+            )
+            .encode(
+
+                x=alt.X(
+                    f"{x_column}:T",
+                    title=x_column
+                ),
+
+                y=alt.Y(
+                    f"{y_column}:Q",
+                    title=y_column
+                ),
+
+                tooltip=[
+                    x_column,
+                    y_column
+                ]
+            )
+            .properties(
+                height=450
+            )
         )
+
 
         st.altair_chart(
             chart,
             use_container_width=True
         )
+
 
     # =====================================================
     # SCATTER
@@ -822,27 +1345,33 @@ def show_chart(question, result):
 
     elif chart_type == "scatter":
 
-        chart = alt.Chart(chart_data).mark_circle(
-            size=100
-        ).encode(
+        chart = (
+            alt.Chart(chart_data)
+            .mark_circle(
+                size=100
+            )
+            .encode(
 
-            x=alt.X(
-                f"{x_column}:Q",
-                title=x_column
-            ),
+                x=alt.X(
+                    f"{x_column}:Q",
+                    title=x_column
+                ),
 
-            y=alt.Y(
-                f"{y_column}:Q",
-                title=y_column
-            ),
+                y=alt.Y(
+                    f"{y_column}:Q",
+                    title=y_column
+                ),
 
-            tooltip=[
-                x_column,
-                y_column
-            ]
-        ).properties(
-            height=450
+                tooltip=[
+                    x_column,
+                    y_column
+                ]
+            )
+            .properties(
+                height=450
+            )
         )
+
 
         st.altair_chart(
             chart,
@@ -856,24 +1385,47 @@ def show_chart(question, result):
 
 for message in st.session_state.messages:
 
-    with st.chat_message(message["role"]):
+    with st.chat_message(
+        message["role"]
+    ):
+
+        # =================================================
+        # USER
+        # =================================================
 
         if message["role"] == "user":
 
-            st.write(message["content"])
+            st.write(
+                message["content"]
+            )
+
+
+        # =================================================
+        # ASSISTANT
+        # =================================================
 
         elif message["role"] == "assistant":
 
+            # ---------------------------------------------
             # Natural-language answer
+            # ---------------------------------------------
+
             if "answer" in message:
 
-                st.write(message["answer"])
+                st.write(
+                    message["answer"]
+                )
 
 
+            # ---------------------------------------------
             # SQL
+            # ---------------------------------------------
+
             if "sql" in message:
 
-                with st.expander("🔍 View generated SQL"):
+                with st.expander(
+                    "🔍 View generated SQL"
+                ):
 
                     st.code(
                         message["sql"],
@@ -881,7 +1433,10 @@ for message in st.session_state.messages:
                     )
 
 
+            # ---------------------------------------------
             # Data
+            # ---------------------------------------------
+
             if "data" in message:
 
                 st.dataframe(
@@ -890,10 +1445,30 @@ for message in st.session_state.messages:
                 )
 
 
+            # ---------------------------------------------
+            # Chart
+            # ---------------------------------------------
+
+            if (
+                "question" in message
+                and "data" in message
+            ):
+
+                show_chart(
+                    message["question"],
+                    message["data"]
+                )
+
+
+            # ---------------------------------------------
             # Error
+            # ---------------------------------------------
+
             if "error" in message:
 
-                st.error(message["error"])
+                st.error(
+                    message["error"]
+                )
 
 
 # =========================================================
@@ -911,9 +1486,9 @@ question = st.chat_input(
 
 if question:
 
-    # -----------------------------------------------------
-    # User message
-    # -----------------------------------------------------
+    # =====================================================
+    # USER MESSAGE
+    # =====================================================
 
     st.session_state.messages.append(
         {
@@ -922,29 +1497,40 @@ if question:
         }
     )
 
+
     with st.chat_message("user"):
 
         st.write(question)
 
 
-    # -----------------------------------------------------
-    # Assistant
-    # -----------------------------------------------------
+    # =====================================================
+    # ASSISTANT
+    # =====================================================
 
     with st.chat_message("assistant"):
 
         try:
 
-            # ---------------------------------------------
-            # Generate SQL
-            # ---------------------------------------------
+            # =============================================
+            # GENERATE SQL
+            # =============================================
 
-            with st.spinner("Understanding your question..."):
+            with st.spinner(
+                "Understanding your question..."
+            ):
 
-                raw_sql = generate_sql(question)
+                raw_sql = generate_sql(
+                    question
+                )
 
-                sql = validate_sql(raw_sql)
+                sql = validate_sql(
+                    raw_sql
+                )
 
+
+            # =============================================
+            # CANNOT ANSWER
+            # =============================================
 
             if sql is None:
 
@@ -953,32 +1539,48 @@ if question:
                     "the uploaded dataset."
                 )
 
-                st.warning(answer)
+
+                st.warning(
+                    answer
+                )
+
 
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
-                        "answer": answer
+                        "answer": answer,
+                        "question": question
                     }
                 )
+
 
                 st.stop()
 
 
-            # ---------------------------------------------
-            # Execute SQL
-            # ---------------------------------------------
+            # =============================================
+            # EXECUTE SQL
+            # =============================================
 
-            with st.spinner("Analyzing your data..."):
+            try:
 
-                result = conn.execute(sql).df()
-                
+                with st.spinner(
+                    "Analyzing your data..."
+                ):
+
+                    result = conn.execute(
+                        sql
+                    ).df()
+
+
             except Exception as first_error:
 
-                # -------------------------------------------------
-                # SQL failed 
-                # -------------------------------------------------
-                with st.spinner("Fixing the query..."):
+                # =========================================
+                # FIRST SQL FAILED
+                # =========================================
+
+                with st.spinner(
+                    "Fixing the query..."
+                ):
 
                     corrected_sql = fix_sql(
                         question,
@@ -986,54 +1588,85 @@ if question:
                         str(first_error)
                     )
 
-                # -------------------------------------------------
-                # Try corrected SQL
-                # -------------------------------------------------
+
+                if corrected_sql is None:
+
+                    raise RuntimeError(
+                        "The generated query "
+                        "could not be corrected."
+                    )
+
+
+                # =========================================
+                # SECOND ATTEMPT
+                # =========================================
+
                 try:
 
-                    with st.spinner("Running corrected query..."):
+                    with st.spinner(
+                        "Running corrected query..."
+                    ):
 
-                        result = conn.execute{
+                        result = conn.execute(
                             corrected_sql
-                        }.df()
+                        ).df()
 
-                    # Use corrected SQL from now on
+
                     sql = corrected_sql
+
+
                 except Exception as second_error:
 
                     raise RuntimeError(
-                        "I couldn't run the generated query. "
-                        f"Database error: {second_error}"
+                        "I couldn't run the generated "
+                        "query after one automatic "
+                        "correction attempt.\n\n"
+                        f"Database error: "
+                        f"{second_error}"
                     )
 
-            # ---------------------------------------------
-            # Generate answer
-            # ---------------------------------------------
+
+            # =============================================
+            # GENERATE ANSWER
+            # =============================================
 
             if result.empty:
+
                 answer = (
-                     "No matching data was found in the uploaded file."
+                    "No matching data was found "
+                    "in the uploaded file."
                 )
+
+
             else:
-                with st.spinner("Preparing the answer..."):
+
+                with st.spinner(
+                    "Preparing the answer..."
+                ):
+
                     answer = generate_answer(
                         question,
                         sql,
                         result
                     )
 
-            # ---------------------------------------------
-            # Display answer
-            # ---------------------------------------------
 
-            st.write(answer)
+            # =============================================
+            # DISPLAY ANSWER
+            # =============================================
+
+            st.write(
+                answer
+            )
 
 
-            # ---------------------------------------------
-            # SQL
-            # ---------------------------------------------
+            # =============================================
+            # DISPLAY SQL
+            # =============================================
 
-            with st.expander("🔍 View generated SQL"):
+            with st.expander(
+                "🔍 View generated SQL"
+            ):
 
                 st.code(
                     sql,
@@ -1041,33 +1674,37 @@ if question:
                 )
 
 
-            # ---------------------------------------------
-            # Result
-            # ---------------------------------------------
+            # =============================================
+            # DISPLAY RESULT
+            # =============================================
 
             st.dataframe(
                 result,
                 use_container_width=True
             )
 
-            # ---------------------------------------------
-            # Chart
-            # ---------------------------------------------
 
-            show_chart(question,result)
-            
+            # =============================================
+            # DISPLAY CHART
+            # =============================================
+
+            show_chart(
+                question,
+                result
+            )
 
 
-            # ---------------------------------------------
-            # Save message
-            # ---------------------------------------------
+            # =============================================
+            # SAVE ASSISTANT MESSAGE
+            # =============================================
 
             st.session_state.messages.append(
                 {
                     "role": "assistant",
                     "answer": answer,
                     "sql": sql,
-                    "data": result
+                    "data": result,
+                    "question": question
                 }
             )
 
@@ -1078,9 +1715,11 @@ if question:
                 f"Something went wrong: {e}"
             )
 
+
             st.session_state.messages.append(
                 {
                     "role": "assistant",
-                    "error": str(e)
+                    "error": str(e),
+                    "question": question
                 }
             )
