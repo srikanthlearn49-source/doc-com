@@ -1,47 +1,45 @@
 import os
-import uuid
-from datetime import datetime, timezone
+from contextlib import contextmanager
 
 import psycopg
 from psycopg.rows import dict_row
-import streamlit as st
 
 
 # =========================================================
-# DATABASE CONFIGURATION
+# DATABASE URL
 # =========================================================
 
 def get_database_url():
     """
-    Get PostgreSQL connection URL.
-
-    Recommended Streamlit secret:
-
-    DATABASE_URL = "postgresql://..."
-
-    Environment variable is also supported.
+    Get PostgreSQL connection string from Streamlit Secrets
+    or environment variables.
     """
 
     try:
+
+        import streamlit as st
+
         database_url = st.secrets.get(
             "DATABASE_URL",
-            None
+            None,
         )
+
+        if database_url:
+            return database_url
+
     except Exception:
-        database_url = None
+        pass
 
-    if not database_url:
-        database_url = os.getenv(
-            "DATABASE_URL"
-        )
-
-    return database_url
+    return os.getenv(
+        "DATABASE_URL"
+    )
 
 
 # =========================================================
-# CONNECTION
+# DATABASE CONNECTION
 # =========================================================
 
+@contextmanager
 def get_connection():
 
     database_url = get_database_url()
@@ -49,166 +47,26 @@ def get_connection():
     if not database_url:
 
         raise RuntimeError(
-            "DATABASE_URL is not configured. "
-            "Add your PostgreSQL connection string "
-            "to Streamlit Secrets."
+            "DATABASE_URL is not configured."
         )
 
-    return psycopg.connect(
-        database_url,
-        row_factory=dict_row
-    )
-
-
-# =========================================================
-# DATABASE HEALTH CHECK
-# =========================================================
-
-def test_database_connection():
+    connection = None
 
     try:
 
-        with get_connection() as conn:
+        connection = psycopg.connect(
+            database_url,
+            row_factory=dict_row,
+            connect_timeout=10,
+        )
 
-            with conn.cursor() as cursor:
+        yield connection
 
-                cursor.execute(
-                    "SELECT 1 AS connected"
-                )
+    finally:
 
-                result = cursor.fetchone()
+        if connection:
 
-        return result["connected"] == 1
-
-    except Exception:
-
-        return False
-
-
-# =========================================================
-# INITIALIZE DATABASE
-# =========================================================
-
-def initialize_database():
-
-    schema_sql = """
-    CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
-    CREATE TABLE IF NOT EXISTS users (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
-        email TEXT UNIQUE NOT NULL,
-
-        password_hash TEXT,
-
-        display_name TEXT,
-
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-
-    CREATE TABLE IF NOT EXISTS datasets (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
-        user_id UUID NOT NULL
-            REFERENCES users(id)
-            ON DELETE CASCADE,
-
-        name TEXT NOT NULL,
-
-        original_filename TEXT NOT NULL,
-
-        file_type TEXT,
-
-        file_size BIGINT,
-
-        table_name TEXT,
-
-        row_count BIGINT,
-
-        column_count INTEGER,
-
-        schema_json JSONB,
-
-        storage_path TEXT,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-
-    CREATE TABLE IF NOT EXISTS conversations (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
-        user_id UUID NOT NULL
-            REFERENCES users(id)
-            ON DELETE CASCADE,
-
-        dataset_id UUID
-            REFERENCES datasets(id)
-            ON DELETE SET NULL,
-
-        title TEXT,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-
-    CREATE TABLE IF NOT EXISTS messages (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
-        conversation_id UUID NOT NULL
-            REFERENCES conversations(id)
-            ON DELETE CASCADE,
-
-        role TEXT NOT NULL,
-
-        content TEXT,
-
-        sql_query TEXT,
-
-        chart_type TEXT,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-
-    CREATE INDEX IF NOT EXISTS idx_datasets_user_id
-        ON datasets(user_id);
-
-
-    CREATE INDEX IF NOT EXISTS idx_conversations_user_id
-        ON conversations(user_id);
-
-
-    CREATE INDEX IF NOT EXISTS idx_conversations_dataset_id
-        ON conversations(dataset_id);
-
-
-    CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
-        ON messages(conversation_id);
-
-
-    CREATE INDEX IF NOT EXISTS idx_messages_created_at
-        ON messages(created_at);
-    """
-
-    with get_connection() as conn:
-
-        with conn.cursor() as cursor:
-
-            cursor.execute(
-                schema_sql
-            )
-
-        conn.commit()
+            connection.close()
 
 
 # =========================================================
@@ -222,170 +80,368 @@ def get_database_status():
     if not database_url:
 
         return {
-            "configured": False,
             "connected": False,
-            "message": (
-                "DATABASE_URL is not configured."
-            )
+            "message": "DATABASE_URL is not configured.",
         }
 
     try:
 
-        initialize_database()
+        with get_connection() as connection:
+
+            with connection.cursor() as cursor:
+
+                cursor.execute(
+                    "SELECT 1;"
+                )
+
+                cursor.fetchone()
 
         return {
-            "configured": True,
             "connected": True,
-            "message": (
-                "PostgreSQL connected successfully."
-            )
+            "message": "PostgreSQL connected.",
         }
 
     except Exception as e:
 
         return {
-            "configured": True,
             "connected": False,
-            "message": str(e)
+            "message": str(e),
         }
 
 
 # =========================================================
-# USER HELPERS
+# INITIALIZE DATABASE
+# =========================================================
+
+def initialize_database():
+
+    database_url = get_database_url()
+
+    if not database_url:
+
+        return False
+
+    try:
+
+        with get_connection() as connection:
+
+            with connection.cursor() as cursor:
+
+                # =================================================
+                # USERS
+                # =================================================
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        id BIGSERIAL PRIMARY KEY,
+
+                        email TEXT NOT NULL UNIQUE,
+
+                        password_hash TEXT NOT NULL,
+
+                        display_name TEXT,
+
+                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+
+
+                # =================================================
+                # DATASETS
+                # =================================================
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS datasets (
+                        id BIGSERIAL PRIMARY KEY,
+
+                        user_id BIGINT NOT NULL
+                            REFERENCES users(id)
+                            ON DELETE CASCADE,
+
+                        file_name TEXT NOT NULL,
+
+                        file_hash TEXT,
+
+                        row_count BIGINT,
+
+                        column_count INTEGER,
+
+                        schema_json JSONB,
+
+                        storage_path TEXT,
+
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+
+
+                # =================================================
+                # CONVERSATIONS
+                # =================================================
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversations (
+                        id BIGSERIAL PRIMARY KEY,
+
+                        user_id BIGINT NOT NULL
+                            REFERENCES users(id)
+                            ON DELETE CASCADE,
+
+                        dataset_id BIGINT
+                            REFERENCES datasets(id)
+                            ON DELETE SET NULL,
+
+                        title TEXT,
+
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+
+
+                # =================================================
+                # MESSAGES
+                # =================================================
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id BIGSERIAL PRIMARY KEY,
+
+                        conversation_id BIGINT NOT NULL
+                            REFERENCES conversations(id)
+                            ON DELETE CASCADE,
+
+                        role TEXT NOT NULL,
+
+                        content TEXT,
+
+                        sql_query TEXT,
+
+                        result_json JSONB,
+
+                        chart_type TEXT,
+
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+
+
+                # =================================================
+                # INDEXES
+                # =================================================
+
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_datasets_user_id
+                    ON datasets(user_id);
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_conversations_user_id
+                    ON conversations(user_id);
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_conversations_dataset_id
+                    ON conversations(dataset_id);
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
+                    ON messages(conversation_id);
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_users_email
+                    ON users(email);
+                    """
+                )
+
+
+            connection.commit()
+
+        return True
+
+    except Exception as e:
+
+        print(
+            f"Database initialization error: {e}"
+        )
+
+        return False
+
+
+# =========================================================
+# USER FUNCTIONS
 # =========================================================
 
 def create_user(
     email,
-    password_hash=None,
-    display_name=None
+    password_hash,
+    display_name=None,
 ):
 
-    user_id = str(
-        uuid.uuid4()
-    )
+    with get_connection() as connection:
 
-    with get_connection() as conn:
-
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
                 INSERT INTO users (
-                    id,
                     email,
                     password_hash,
                     display_name
                 )
+
                 VALUES (
-                    %s,
                     %s,
                     %s,
                     %s
                 )
-                RETURNING *
+
+                RETURNING
+                    id,
+                    email,
+                    password_hash,
+                    display_name,
+                    is_active,
+                    created_at,
+                    updated_at;
                 """,
                 (
-                    user_id,
-                    email.lower().strip(),
+                    email,
                     password_hash,
-                    display_name
-                )
+                    display_name,
+                ),
             )
 
             user = cursor.fetchone()
 
-        conn.commit()
+        connection.commit()
 
     return user
 
 
-def get_user_by_email(email):
+def get_user_by_email(
+    email,
+):
 
-    with get_connection() as conn:
+    with get_connection() as connection:
 
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
-                SELECT *
+                SELECT
+                    id,
+                    email,
+                    password_hash,
+                    display_name,
+                    is_active,
+                    created_at,
+                    updated_at
+
                 FROM users
+
                 WHERE LOWER(email) = LOWER(%s)
-                LIMIT 1
+
+                LIMIT 1;
                 """,
                 (
-                    email.strip(),
-                )
+                    email,
+                ),
             )
 
             return cursor.fetchone()
 
 
-def get_user_by_id(user_id):
+def get_user_by_id(
+    user_id,
+):
 
-    with get_connection() as conn:
+    with get_connection() as connection:
 
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
-                SELECT *
+                SELECT
+                    id,
+                    email,
+                    password_hash,
+                    display_name,
+                    is_active,
+                    created_at,
+                    updated_at
+
                 FROM users
+
                 WHERE id = %s
-                LIMIT 1
+
+                LIMIT 1;
                 """,
                 (
                     user_id,
-                )
+                ),
             )
 
             return cursor.fetchone()
 
 
 # =========================================================
-# DATASET HELPERS
+# DATASET FUNCTIONS
 # =========================================================
 
 def create_dataset(
     user_id,
-    name,
-    original_filename,
-    file_type=None,
-    file_size=None,
-    table_name=None,
+    file_name,
+    file_hash=None,
     row_count=None,
     column_count=None,
     schema_json=None,
-    storage_path=None
+    storage_path=None,
 ):
 
-    dataset_id = str(
-        uuid.uuid4()
-    )
+    with get_connection() as connection:
 
-    with get_connection() as conn:
-
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
                 INSERT INTO datasets (
-                    id,
                     user_id,
-                    name,
-                    original_filename,
-                    file_type,
-                    file_size,
-                    table_name,
+                    file_name,
+                    file_hash,
                     row_count,
                     column_count,
                     schema_json,
                     storage_path
                 )
+
                 VALUES (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
                     %s,
                     %s,
                     %s,
@@ -394,148 +450,123 @@ def create_dataset(
                     %s,
                     %s
                 )
-                RETURNING *
+
+                RETURNING *;
                 """,
                 (
-                    dataset_id,
                     user_id,
-                    name,
-                    original_filename,
-                    file_type,
-                    file_size,
-                    table_name,
+                    file_name,
+                    file_hash,
                     row_count,
                     column_count,
                     schema_json,
-                    storage_path
-                )
+                    storage_path,
+                ),
             )
 
             dataset = cursor.fetchone()
 
-        conn.commit()
+        connection.commit()
 
     return dataset
 
 
-def get_user_datasets(user_id):
+def get_datasets_for_user(
+    user_id,
+):
 
-    with get_connection() as conn:
+    with get_connection() as connection:
 
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
                 SELECT *
+
                 FROM datasets
+
                 WHERE user_id = %s
-                ORDER BY created_at DESC
+
+                ORDER BY created_at DESC;
                 """,
                 (
                     user_id,
-                )
+                ),
             )
 
             return cursor.fetchall()
 
 
-def get_dataset(
-    dataset_id,
-    user_id
-):
-
-    with get_connection() as conn:
-
-        with conn.cursor() as cursor:
-
-            cursor.execute(
-                """
-                SELECT *
-                FROM datasets
-                WHERE id = %s
-                AND user_id = %s
-                LIMIT 1
-                """,
-                (
-                    dataset_id,
-                    user_id
-                )
-            )
-
-            return cursor.fetchone()
-
-
 # =========================================================
-# CONVERSATION HELPERS
+# CONVERSATION FUNCTIONS
 # =========================================================
 
 def create_conversation(
     user_id,
     dataset_id=None,
-    title=None
+    title=None,
 ):
 
-    conversation_id = str(
-        uuid.uuid4()
-    )
+    with get_connection() as connection:
 
-    with get_connection() as conn:
-
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
                 INSERT INTO conversations (
-                    id,
                     user_id,
                     dataset_id,
                     title
                 )
+
                 VALUES (
-                    %s,
                     %s,
                     %s,
                     %s
                 )
-                RETURNING *
+
+                RETURNING *;
                 """,
                 (
-                    conversation_id,
                     user_id,
                     dataset_id,
-                    title
-                )
+                    title,
+                ),
             )
 
             conversation = cursor.fetchone()
 
-        conn.commit()
+        connection.commit()
 
     return conversation
 
 
-def get_user_conversations(
-    user_id
+def get_conversations_for_user(
+    user_id,
 ):
 
-    with get_connection() as conn:
+    with get_connection() as connection:
 
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
                 SELECT
                     c.*,
-                    d.name AS dataset_name
+                    d.file_name
+
                 FROM conversations c
+
                 LEFT JOIN datasets d
-                    ON c.dataset_id = d.id
+                    ON d.id = c.dataset_id
+
                 WHERE c.user_id = %s
-                ORDER BY c.updated_at DESC
+
+                ORDER BY c.updated_at DESC;
                 """,
                 (
                     user_id,
-                )
+                ),
             )
 
             return cursor.fetchall()
@@ -543,61 +574,36 @@ def get_user_conversations(
 
 def get_conversation(
     conversation_id,
-    user_id
+    user_id,
 ):
 
-    with get_connection() as conn:
+    with get_connection() as connection:
 
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
                 SELECT *
+
                 FROM conversations
+
                 WHERE id = %s
+
                 AND user_id = %s
-                LIMIT 1
+
+                LIMIT 1;
                 """,
                 (
                     conversation_id,
-                    user_id
-                )
+                    user_id,
+                ),
             )
 
             return cursor.fetchone()
 
 
-def update_conversation_title(
-    conversation_id,
-    user_id,
-    title
-):
-
-    with get_connection() as conn:
-
-        with conn.cursor() as cursor:
-
-            cursor.execute(
-                """
-                UPDATE conversations
-                SET
-                    title = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                AND user_id = %s
-                """,
-                (
-                    title,
-                    conversation_id,
-                    user_id
-                )
-            )
-
-        conn.commit()
-
-
 # =========================================================
-# MESSAGE HELPERS
+# MESSAGE FUNCTIONS
 # =========================================================
 
 def create_message(
@@ -605,27 +611,25 @@ def create_message(
     role,
     content=None,
     sql_query=None,
-    chart_type=None
+    result_json=None,
+    chart_type=None,
 ):
 
-    message_id = str(
-        uuid.uuid4()
-    )
+    with get_connection() as connection:
 
-    with get_connection() as conn:
-
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
                 INSERT INTO messages (
-                    id,
                     conversation_id,
                     role,
                     content,
                     sql_query,
+                    result_json,
                     chart_type
                 )
+
                 VALUES (
                     %s,
                     %s,
@@ -634,112 +638,138 @@ def create_message(
                     %s,
                     %s
                 )
-                RETURNING *
+
+                RETURNING *;
                 """,
                 (
-                    message_id,
                     conversation_id,
                     role,
                     content,
                     sql_query,
-                    chart_type
-                )
+                    result_json,
+                    chart_type,
+                ),
             )
 
             message = cursor.fetchone()
 
+
+            # Update conversation timestamp
+
             cursor.execute(
                 """
                 UPDATE conversations
+
                 SET updated_at = NOW()
-                WHERE id = %s
+
+                WHERE id = %s;
                 """,
                 (
                     conversation_id,
-                )
+                ),
             )
 
-        conn.commit()
+        connection.commit()
 
     return message
 
 
-def get_conversation_messages(
+def get_messages_for_conversation(
     conversation_id,
-    user_id
+    user_id,
 ):
 
-    with get_connection() as conn:
+    with get_connection() as connection:
 
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
                 SELECT
                     m.*
+
                 FROM messages m
+
                 INNER JOIN conversations c
-                    ON m.conversation_id = c.id
+                    ON c.id = m.conversation_id
+
                 WHERE m.conversation_id = %s
+
                 AND c.user_id = %s
-                ORDER BY m.created_at ASC
+
+                ORDER BY m.created_at ASC,
+                         m.id ASC;
                 """,
                 (
                     conversation_id,
-                    user_id
-                )
+                    user_id,
+                ),
             )
 
             return cursor.fetchall()
 
 
 # =========================================================
-# DELETE HELPERS
+# UPDATE CONVERSATION TITLE
+# =========================================================
+
+def update_conversation_title(
+    conversation_id,
+    user_id,
+    title,
+):
+
+    with get_connection() as connection:
+
+        with connection.cursor() as cursor:
+
+            cursor.execute(
+                """
+                UPDATE conversations
+
+                SET
+                    title = %s,
+                    updated_at = NOW()
+
+                WHERE id = %s
+
+                AND user_id = %s;
+                """,
+                (
+                    title,
+                    conversation_id,
+                    user_id,
+                ),
+            )
+
+        connection.commit()
+
+
+# =========================================================
+# DELETE CONVERSATION
 # =========================================================
 
 def delete_conversation(
     conversation_id,
-    user_id
+    user_id,
 ):
 
-    with get_connection() as conn:
+    with get_connection() as connection:
 
-        with conn.cursor() as cursor:
+        with connection.cursor() as cursor:
 
             cursor.execute(
                 """
                 DELETE FROM conversations
+
                 WHERE id = %s
-                AND user_id = %s
+
+                AND user_id = %s;
                 """,
                 (
                     conversation_id,
-                    user_id
-                )
+                    user_id,
+                ),
             )
 
-        conn.commit()
-
-
-def delete_dataset(
-    dataset_id,
-    user_id
-):
-
-    with get_connection() as conn:
-
-        with conn.cursor() as cursor:
-
-            cursor.execute(
-                """
-                DELETE FROM datasets
-                WHERE id = %s
-                AND user_id = %s
-                """,
-                (
-                    dataset_id,
-                    user_id
-                )
-            )
-
-        conn.commit()
+        connection.commit()
