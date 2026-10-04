@@ -1,10 +1,21 @@
+import hashlib
+import hmac
+import re
+import secrets
+import json
+
 import streamlit as st
 import pandas as pd
 import duckdb
 from groq import Groq
-import re
 import altair as alt
-import io
+
+from db import (
+    initialize_database,
+    get_database_status,
+    create_user,
+    get_user_by_email,
+)
 
 
 # =========================================================
@@ -14,22 +25,16 @@ import io
 st.set_page_config(
     page_title="Chat With Your Data",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("📊 Chat With Your Data")
-st.caption(
-    "Upload your data and ask questions in natural language."
-)
+st.caption("Ask questions about your CSV or Excel data.")
 
 
 # =========================================================
-# GROQ
+# CONFIGURATION
 # =========================================================
-
-client = Groq(
-    api_key=st.secrets["GROQ_API_KEY"]
-)
 
 MODEL = "openai/gpt-oss-20b"
 
@@ -38,633 +43,491 @@ MODEL = "openai/gpt-oss-20b"
 # SESSION STATE
 # =========================================================
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+DEFAULT_STATE = {
+    "messages": [],
+    "file_name": None,
+    "df": None,
+    "question_input": "",
+    "suggestions": [],
+    "suggestions_file": None,
+    "auth_mode": "guest",
+    "user": None,
+}
 
-if "file_signature" not in st.session_state:
-    st.session_state.file_signature = None
+for key, value in DEFAULT_STATE.items():
 
-if "sheets" not in st.session_state:
-    st.session_state.sheets = {}
-
-if "table_names" not in st.session_state:
-    st.session_state.table_names = {}
-
-if "uploaded_files" not in st.session_state:
-    st.session_state.uploaded_files = []
-
-if "question_input" not in st.session_state:
-    st.session_state.question_input = ""
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # =========================================================
-# HELPER - DATE DETECTION
+# GROQ
 # =========================================================
 
-def is_date_like(series):
+try:
 
-    if pd.api.types.is_datetime64_any_dtype(series):
-        return True
-
-    if not (
-        pd.api.types.is_object_dtype(series)
-        or pd.api.types.is_string_dtype(series)
-    ):
-        return False
-
-    sample = (
-        series
-        .dropna()
-        .astype(str)
-        .head(50)
+    client = Groq(
+        api_key=st.secrets["GROQ_API_KEY"]
     )
 
-    if sample.empty:
-        return False
+except Exception as e:
 
-    converted = pd.to_datetime(
-        sample,
-        errors="coerce"
+    st.error(
+        "Groq API key is not configured correctly."
+    )
+
+    st.stop()
+
+
+# =========================================================
+# AUTHENTICATION HELPERS
+# =========================================================
+
+def hash_password(password):
+    """
+    Hash a password using PBKDF2-HMAC-SHA256.
+
+    The salt is stored together with the hash.
+    """
+
+    salt = secrets.token_bytes(16)
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        310000,
     )
 
     return (
-        converted.notna().mean() >= 0.8
+        salt.hex()
+        + "$"
+        + password_hash.hex()
     )
 
 
-# =========================================================
-# SAFE TABLE NAME
-# =========================================================
+def verify_password(password, stored_hash):
 
-def make_safe_table_name(
-    name,
-    used_names=None
-):
+    try:
 
-    if used_names is None:
-        used_names = set()
-
-    table_name = re.sub(
-        r"[^a-zA-Z0-9_]",
-        "_",
-        str(name)
-    ).lower()
-
-    table_name = table_name.strip("_")
-
-    if not table_name:
-        table_name = "uploaded_data"
-
-    if table_name[0].isdigit():
-        table_name = f"table_{table_name}"
-
-    original_name = table_name
-    counter = 2
-
-    while table_name in used_names:
-
-        table_name = (
-            f"{original_name}_{counter}"
+        salt_hex, hash_hex = stored_hash.split(
+            "$",
+            1
         )
 
-        counter += 1
-
-    return table_name
-
-
-# =========================================================
-# FILE SIGNATURE
-# =========================================================
-
-def get_file_signature(files):
-
-    if not files:
-        return None
-
-    parts = []
-
-    for uploaded_file in files:
-
-        parts.append(
-            f"{uploaded_file.name}:"
-            f"{uploaded_file.size}"
+        salt = bytes.fromhex(
+            salt_hex
         )
 
-    return "|".join(parts)
+        expected_hash = bytes.fromhex(
+            hash_hex
+        )
+
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            310000,
+        )
+
+        return hmac.compare_digest(
+            actual_hash,
+            expected_hash,
+        )
+
+    except Exception:
+
+        return False
 
 
 # =========================================================
-# FILE-SPECIFIC SUGGESTED QUESTIONS
+# DATABASE INITIALIZATION
 # =========================================================
 
-def generate_suggested_questions(
-    sheets
-):
+database_status = get_database_status()
 
-    questions = []
 
-    for table_name, df in sheets.items():
+# =========================================================
+# AUTH UI
+# =========================================================
 
-        if df.empty:
-            continue
+def show_authentication():
 
-        columns = list(df.columns)
+    st.sidebar.markdown("---")
 
-        numeric_columns = []
-        text_columns = []
-        date_columns = []
+    st.sidebar.subheader("👤 Account")
 
-        for column in columns:
+    if st.session_state.user:
 
-            series = df[column]
+        user = st.session_state.user
 
-            if pd.api.types.is_numeric_dtype(series):
-
-                numeric_columns.append(column)
-
-            elif is_date_like(series):
-
-                date_columns.append(column)
-
-            else:
-
-                text_columns.append(column)
-
-        # =================================================
-        # NUMERIC COLUMNS
-        # =================================================
-
-        for column in numeric_columns[:4]:
-
-            questions.append(
-                f"What is the average {column}?"
-            )
-
-            questions.append(
-                f"What is the highest {column}?"
-            )
-
-            questions.append(
-                f"What is the lowest {column}?"
-            )
-
-        # =================================================
-        # TEXT / CATEGORY COLUMNS
-        # =================================================
-
-        for column in text_columns[:4]:
-
-            questions.append(
-                f"Show the number of records by {column}."
-            )
-
-            questions.append(
-                f"Which {column} has the most records?"
-            )
-
-        # =================================================
-        # CATEGORY + NUMERIC
-        # =================================================
-
-        if text_columns and numeric_columns:
-
-            category = text_columns[0]
-            numeric = numeric_columns[0]
-
-            questions.append(
-                f"Show the average {numeric} by {category}."
-            )
-
-            questions.append(
-                f"Compare {numeric} by {category}."
-            )
-
-            questions.append(
-                f"Show the top 5 {category} values "
-                f"by average {numeric}."
-            )
-
-            questions.append(
-                f"Show the percentage share by {category}."
-            )
-
-        # =================================================
-        # MULTIPLE NUMERIC COLUMNS
-        # =================================================
-
-        if len(numeric_columns) >= 2:
-
-            first_numeric = numeric_columns[0]
-            second_numeric = numeric_columns[1]
-
-            questions.append(
-                f"Compare {first_numeric} and "
-                f"{second_numeric}."
-            )
-
-        # =================================================
-        # DATE + NUMERIC
-        # =================================================
-
-        if date_columns and numeric_columns:
-
-            date_column = date_columns[0]
-            numeric_column = numeric_columns[0]
-
-            questions.append(
-                f"Show the {numeric_column} trend over time."
-            )
-
-            questions.append(
-                f"Show {numeric_column} by "
-                f"{date_column}."
-            )
-
-        # =================================================
-        # GENERAL QUESTIONS
-        # =================================================
-
-        questions.append(
-            "How many records are in the dataset?"
+        display_name = (
+            user.get("display_name")
+            or user.get("email")
+            or "User"
         )
 
-        questions.append(
-            "Show me a summary of the dataset."
+        st.sidebar.success(
+            f"Logged in as {display_name}"
         )
 
-        # =================================================
-        # REMOVE DUPLICATES
-        # =================================================
+        if st.sidebar.button(
+            "Logout",
+            use_container_width=True,
+        ):
 
-        unique_questions = []
+            st.session_state.user = None
+            st.session_state.auth_mode = "guest"
+            st.session_state.messages = []
+            st.session_state.file_name = None
+            st.session_state.df = None
+            st.session_state.suggestions = []
+            st.session_state.suggestions_file = None
 
-        for question in questions:
+            st.rerun()
 
-            if question not in unique_questions:
+        return
 
-                unique_questions.append(
-                    question
-                )
 
-        return unique_questions[:12]
+    auth_choice = st.sidebar.radio(
+        "Mode",
+        [
+            "Guest Mode",
+            "Login",
+            "Register",
+        ],
+        key="auth_mode_selector",
+    )
 
-    return []
+
+    if auth_choice == "Guest Mode":
+
+        st.session_state.auth_mode = "guest"
+
+        st.sidebar.info(
+            "Guest Mode stores your current "
+            "working data in the Streamlit session."
+        )
+
+        return
+
+
+    if not database_status["connected"]:
+
+        st.sidebar.error(
+            "PostgreSQL is not available. "
+            "Configure DATABASE_URL in Streamlit Secrets."
+        )
+
+        return
+
+
+    # =====================================================
+    # LOGIN
+    # =====================================================
+
+    if auth_choice == "Login":
+
+        st.session_state.auth_mode = "login"
+
+        with st.sidebar.form(
+            "login_form"
+        ):
+
+            st.subheader("🔐 Login")
+
+            email = st.text_input(
+                "Email"
+            )
+
+            password = st.text_input(
+                "Password",
+                type="password",
+            )
+
+            submitted = st.form_submit_button(
+                "Login",
+                use_container_width=True,
+            )
+
+            if submitted:
+
+                email = email.strip().lower()
+
+                if not email or not password:
+
+                    st.error(
+                        "Enter your email and password."
+                    )
+
+                else:
+
+                    try:
+
+                        user = get_user_by_email(
+                            email
+                        )
+
+                        if (
+                            user
+                            and user.get("is_active", True)
+                            and user.get("password_hash")
+                            and verify_password(
+                                password,
+                                user["password_hash"],
+                            )
+                        ):
+
+                            st.session_state.user = user
+                            st.session_state.auth_mode = "user"
+
+                            st.success(
+                                "Login successful."
+                            )
+
+                            st.rerun()
+
+                        else:
+
+                            st.error(
+                                "Invalid email or password."
+                            )
+
+                    except Exception as e:
+
+                        st.error(
+                            "Login failed. "
+                            "Please try again."
+                        )
+
+
+    # =====================================================
+    # REGISTER
+    # =====================================================
+
+    elif auth_choice == "Register":
+
+        st.session_state.auth_mode = "register"
+
+        with st.sidebar.form(
+            "register_form"
+        ):
+
+            st.subheader("📝 Create Account")
+
+            display_name = st.text_input(
+                "Name"
+            )
+
+            email = st.text_input(
+                "Email"
+            )
+
+            password = st.text_input(
+                "Password",
+                type="password",
+            )
+
+            confirm_password = st.text_input(
+                "Confirm password",
+                type="password",
+            )
+
+            submitted = st.form_submit_button(
+                "Create account",
+                use_container_width=True,
+            )
+
+            if submitted:
+
+                email = email.strip().lower()
+
+                if not email or not password:
+
+                    st.error(
+                        "Email and password are required."
+                    )
+
+                elif len(password) < 8:
+
+                    st.error(
+                        "Password must contain at least "
+                        "8 characters."
+                    )
+
+                elif password != confirm_password:
+
+                    st.error(
+                        "Passwords do not match."
+                    )
+
+                else:
+
+                    try:
+
+                        existing_user = get_user_by_email(
+                            email
+                        )
+
+                        if existing_user:
+
+                            st.error(
+                                "An account with this "
+                                "email already exists."
+                            )
+
+                        else:
+
+                            password_hash = hash_password(
+                                password
+                            )
+
+                            user = create_user(
+                                email=email,
+                                password_hash=password_hash,
+                                display_name=(
+                                    display_name.strip()
+                                    or None
+                                ),
+                            )
+
+                            st.session_state.user = user
+                            st.session_state.auth_mode = "user"
+
+                            st.success(
+                                "Account created successfully."
+                            )
+
+                            st.rerun()
+
+                    except Exception as e:
+
+                        st.error(
+                            "Could not create account. "
+                            "Please try again."
+                        )
+
+
+# =========================================================
+# SHOW AUTHENTICATION
+# =========================================================
+
+show_authentication()
+
+
+# =========================================================
+# DATABASE STATUS
+# =========================================================
+
+with st.sidebar:
+
+    st.markdown("---")
+
+    if database_status["connected"]:
+
+        st.success(
+            "PostgreSQL: Connected"
+        )
+
+    else:
+
+        st.warning(
+            "PostgreSQL: Not configured"
+        )
+
+
+# =========================================================
+# CURRENT USER
+# =========================================================
+
+current_user = st.session_state.user
 
 
 # =========================================================
 # FILE UPLOAD
 # =========================================================
 
-uploaded_files = st.file_uploader(
-    "Upload CSV or Excel files",
-    type=["csv", "xlsx", "xls"],
-    accept_multiple_files=True
+uploaded_file = st.file_uploader(
+    "Upload CSV or Excel file",
+    type=[
+        "csv",
+        "xlsx",
+        "xls",
+    ],
 )
 
 
-if not uploaded_files:
+if uploaded_file is None:
 
     st.info(
-        "Upload one or more CSV or Excel files to get started."
+        "Upload a CSV or Excel file to get started."
     )
 
     st.stop()
 
 
-current_signature = get_file_signature(
-    uploaded_files
-)
-
-
 # =========================================================
-# READ FILES
+# READ FILE
 # =========================================================
 
 if (
-    st.session_state.file_signature
-    != current_signature
+    st.session_state.file_name
+    != uploaded_file.name
 ):
 
     try:
 
-        sheets = {}
-        table_names = {}
-        used_table_names = set()
+        if uploaded_file.name.lower().endswith(
+            ".csv"
+        ):
 
-        for uploaded_file in uploaded_files:
-
-            file_name = uploaded_file.name
-
-            # =============================================
-            # CSV
-            # =============================================
-
-            if file_name.lower().endswith(".csv"):
-
-                df = pd.read_csv(
-                    uploaded_file
-                )
-
-                base_name = re.sub(
-                    r"\.[^.]+$",
-                    "",
-                    file_name
-                )
-
-                table_name = make_safe_table_name(
-                    base_name,
-                    used_table_names
-                )
-
-                sheets[table_name] = df
-
-                table_names[
-                    file_name
-                ] = table_name
-
-                used_table_names.add(
-                    table_name
-                )
-
-            # =============================================
-            # EXCEL
-            # =============================================
-
-            else:
-
-                excel_file = pd.ExcelFile(
-                    uploaded_file
-                )
-
-                for sheet_name in excel_file.sheet_names:
-
-                    sheet_df = pd.read_excel(
-                        uploaded_file,
-                        sheet_name=sheet_name
-                    )
-
-                    if sheet_df.empty:
-                        continue
-
-                    base_name = (
-                        f"{file_name}_{sheet_name}"
-                    )
-
-                    table_name = make_safe_table_name(
-                        base_name,
-                        used_table_names
-                    )
-
-                    sheets[table_name] = sheet_df
-
-                    table_names[
-                        f"{file_name} / {sheet_name}"
-                    ] = table_name
-
-                    used_table_names.add(
-                        table_name
-                    )
-
-        if not sheets:
-
-            st.error(
-                "No usable data was found."
+            df = pd.read_csv(
+                uploaded_file
             )
 
-            st.stop()
+        else:
 
-        st.session_state.sheets = sheets
+            df = pd.read_excel(
+                uploaded_file
+            )
 
-        st.session_state.table_names = (
-            table_names
+        st.session_state.df = df
+
+        st.session_state.file_name = (
+            uploaded_file.name
         )
 
-        st.session_state.file_signature = (
-            current_signature
-        )
-
-        st.session_state.uploaded_files = [
-            file.name
-            for file in uploaded_files
-        ]
-
-        # New file = new conversation
+        # Reset conversation
         st.session_state.messages = []
 
-        # Clear question
+        # Reset suggestions
+        st.session_state.suggestions = []
+
+        st.session_state.suggestions_file = None
+
+        # Reset question input
         st.session_state.question_input = ""
 
     except Exception as e:
 
         st.error(
-            f"Could not read uploaded files: {e}"
+            f"Could not read file: {e}"
         )
 
         st.stop()
 
 
-# =========================================================
-# DUCKDB
-# =========================================================
-
-conn = duckdb.connect(
-    ":memory:"
-)
-
-for table_name, df in (
-    st.session_state.sheets.items()
-):
-
-    conn.register(
-        table_name,
-        df
-    )
+df = st.session_state.df
 
 
 # =========================================================
-# DATA SUMMARY
+# FILE INFORMATION
 # =========================================================
-
-total_rows = sum(
-    len(df)
-    for df in st.session_state.sheets.values()
-)
-
-total_columns = sum(
-    len(df.columns)
-    for df in st.session_state.sheets.values()
-)
 
 st.success(
-    f"Loaded {len(st.session_state.sheets)} table(s) • "
-    f"{total_rows:,} total rows • "
-    f"{total_columns:,} total columns"
+    f"Loaded: {st.session_state.file_name} "
+    f"({len(df):,} rows × {len(df.columns):,} columns)"
 )
-
-
-# =========================================================
-# SUGGESTED QUESTIONS
-# =========================================================
-
-suggested_questions = (
-    generate_suggested_questions(
-        st.session_state.sheets
-    )
-)
-
-
-# =========================================================
-# QUESTION CALLBACK
-# =========================================================
-
-def select_suggestion(question):
-
-    st.session_state.question_input = question
-
-
-# =========================================================
-# SIDEBAR
-# =========================================================
-
-with st.sidebar:
-
-    st.header("📁 Data")
-
-    st.write(
-        f"**Tables:** "
-        f"{len(st.session_state.sheets)}"
-    )
-
-    for table_name, df in (
-        st.session_state.sheets.items()
-    ):
-
-        st.caption(
-            f"**{table_name}**"
-        )
-
-        st.caption(
-            f"{len(df):,} rows × "
-            f"{len(df.columns):,} columns"
-        )
-
-    st.divider()
-
-    st.header("💡 Suggested questions")
-
-    if suggested_questions:
-
-        st.caption(
-            "Click a question to put it into "
-            "the question box."
-        )
-
-        for index, suggestion in enumerate(
-            suggested_questions
-        ):
-
-            st.button(
-                suggestion,
-                key=f"suggestion_{index}",
-                use_container_width=True,
-                on_click=select_suggestion,
-                args=(suggestion,)
-            )
-
-    else:
-
-        st.caption(
-            "No suggestions available for this file."
-        )
-
-    st.divider()
-
-    if st.button(
-        "🗑️ Clear conversation",
-        use_container_width=True
-    ):
-
-        st.session_state.messages = []
-
-        st.session_state.question_input = ""
-
-        st.rerun()
-
-
-# =========================================================
-# DATA PROFILE
-# =========================================================
-
-with st.expander(
-    "🔎 Data profile"
-):
-
-    for table_name, df in (
-        st.session_state.sheets.items()
-    ):
-
-        st.markdown(
-            f"### `{table_name}`"
-        )
-
-        profile_col1, profile_col2, profile_col3 = (
-            st.columns(3)
-        )
-
-        with profile_col1:
-
-            st.metric(
-                "Rows",
-                f"{len(df):,}"
-            )
-
-        with profile_col2:
-
-            st.metric(
-                "Columns",
-                f"{len(df.columns):,}"
-            )
-
-        with profile_col3:
-
-            missing_count = int(
-                df.isna().sum().sum()
-            )
-
-            st.metric(
-                "Missing values",
-                f"{missing_count:,}"
-            )
-
-        profile_data = []
-
-        for column in df.columns:
-
-            series = df[column]
-
-            profile_data.append(
-                {
-                    "Column": column,
-                    "Type": str(series.dtype),
-                    "Non-null": int(
-                        series.notna().sum()
-                    ),
-                    "Missing": int(
-                        series.isna().sum()
-                    ),
-                    "Unique": int(
-                        series.nunique(
-                            dropna=True
-                        )
-                    )
-                }
-            )
-
-        st.dataframe(
-            pd.DataFrame(profile_data),
-            use_container_width=True,
-            hide_index=True
-        )
 
 
 # =========================================================
@@ -675,110 +538,580 @@ with st.expander(
     "📄 Preview uploaded data"
 ):
 
-    for table_name, df in (
-        st.session_state.sheets.items()
-    ):
+    st.dataframe(
+        df.head(100),
+        use_container_width=True,
+    )
 
-        st.markdown(
-            f"### `{table_name}`"
-        )
 
-        st.dataframe(
-            df.head(20),
-            use_container_width=True
-        )
+# =========================================================
+# DUCKDB
+# =========================================================
+
+conn = duckdb.connect(
+    ":memory:"
+)
+
+conn.register(
+    "uploaded_data",
+    df,
+)
 
 
 # =========================================================
 # SCHEMA
 # =========================================================
 
-schema_parts = []
-
-for table_name, df in (
-    st.session_state.sheets.items()
-):
-
-    column_lines = []
-
-    for column in df.columns:
-
-        dtype = str(
-            df[column].dtype
-        )
-
-        column_lines.append(
-            f"  - {column}: {dtype}"
-        )
-
-    schema_parts.append(
-        f"""
-TABLE: {table_name}
-
-Columns:
-{chr(10).join(column_lines)}
-"""
-    )
-
 schema_text = "\n".join(
-    schema_parts
+    f"- {column}: {df[column].dtype}"
+    for column in df.columns
 )
 
 
 # =========================================================
-# CONVERSATION HISTORY
+# DATASET PROFILE
 # =========================================================
 
-def get_conversation_history():
+def build_dataset_profile():
 
-    history = []
+    profile = []
 
-    for message in st.session_state.messages:
+    for column in df.columns:
 
-        if message.get("role") == "user":
+        series = df[column]
 
-            history.append(
-                f"USER: {message['content']}"
+        dtype = str(
+            series.dtype
+        )
+
+        non_null = series.dropna()
+
+        unique_count = int(
+            series.nunique(
+                dropna=True
             )
+        )
 
-        elif message.get("role") == "assistant":
+        sample_values = (
+            non_null
+            .astype(str)
+            .head(8)
+            .tolist()
+        )
 
-            if "answer" in message:
+        profile.append(
+            {
+                "column": column,
+                "dtype": dtype,
+                "unique_values": unique_count,
+                "sample_values": sample_values,
+            }
+        )
 
-                history.append(
-                    f"ASSISTANT: "
-                    f"{message['answer']}"
+    return profile
+
+
+dataset_profile = build_dataset_profile()
+
+
+profile_text = json.dumps(
+    dataset_profile,
+    indent=2,
+    default=str,
+)
+
+
+# =========================================================
+# SUGGESTED QUESTIONS
+# =========================================================
+
+def normalize_question(question):
+
+    question = question.lower().strip()
+
+    question = re.sub(
+        r"[^a-z0-9\s]",
+        " ",
+        question,
+    )
+
+    question = re.sub(
+        r"\s+",
+        " ",
+        question,
+    )
+
+    return question
+
+
+def are_questions_similar(
+    question_a,
+    question_b,
+):
+
+    a = set(
+        normalize_question(
+            question_a
+        ).split()
+    )
+
+    b = set(
+        normalize_question(
+            question_b
+        ).split()
+    )
+
+    if not a or not b:
+        return False
+
+    intersection = len(
+        a.intersection(b)
+    )
+
+    union = len(
+        a.union(b)
+    )
+
+    similarity = (
+        intersection / union
+    )
+
+    return similarity >= 0.60
+
+
+def clean_suggestions(
+    suggestions,
+    max_items=8,
+):
+
+    cleaned = []
+
+    for suggestion in suggestions:
+
+        if not isinstance(
+            suggestion,
+            str,
+        ):
+
+            continue
+
+        suggestion = suggestion.strip()
+
+        suggestion = re.sub(
+            r"^\d+[\.\)]\s*",
+            "",
+            suggestion,
+        )
+
+        suggestion = suggestion.strip(
+            "\"' "
+        )
+
+        if len(suggestion) < 10:
+            continue
+
+        if suggestion in cleaned:
+            continue
+
+        is_similar = any(
+            are_questions_similar(
+                suggestion,
+                existing,
+            )
+            for existing in cleaned
+        )
+
+        if is_similar:
+            continue
+
+        cleaned.append(
+            suggestion
+        )
+
+        if len(cleaned) >= max_items:
+            break
+
+    return cleaned
+
+
+def generate_suggestions():
+
+    question_prompt = f"""
+You are an expert data analyst designing useful questions
+for a natural-language data exploration application.
+
+The user uploaded a dataset.
+
+DATASET PROFILE:
+
+{profile_text}
+
+SCHEMA:
+
+{schema_text}
+
+Generate exactly 8 useful questions that can be answered
+using this dataset.
+
+IMPORTANT:
+
+The questions MUST be genuinely different from each other.
+
+Do NOT generate eight variations of:
+- top products
+- highest sales
+- lowest sales
+- sales by category
+
+Instead, deliberately use different analytical intents.
+
+Use these 8 categories, exactly once each:
+
+1. Ranking
+2. Filtering / lookup
+3. Aggregation
+4. Comparison
+5. Distribution / percentage
+6. Relationship between numeric fields
+7. Time trend, if a date/time field exists; otherwise use segmentation
+8. Detailed record exploration
+
+Rules:
+
+- Every question must use columns or concepts that actually exist
+  in the dataset.
+- Do not invent column names.
+- Do not assume the dataset is about sales, products, or customers.
+- Adapt completely to the uploaded dataset.
+- Avoid repeating the same wording.
+- Avoid questions that differ only by changing one column.
+- Prefer practical questions a user would actually ask.
+- Keep each question concise.
+- Return ONLY a JSON array of 8 strings.
+- No markdown.
+- No explanations.
+"""
+
+    response = client.chat.completions.create(
+
+        model=MODEL,
+
+        messages=[
+            {
+                "role": "system",
+                "content": question_prompt,
+            }
+        ],
+
+        temperature=0.7,
+    )
+
+    content = (
+        response
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
+
+    content = re.sub(
+        r"```json",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    )
+
+    content = content.replace(
+        "```",
+        "",
+    ).strip()
+
+    try:
+
+        suggestions = json.loads(
+            content
+        )
+
+    except Exception:
+
+        suggestions = []
+
+        for line in content.splitlines():
+
+            line = line.strip()
+
+            if line:
+                suggestions.append(
+                    line
                 )
 
-            if "sql" in message:
+    suggestions = clean_suggestions(
+        suggestions,
+        max_items=8,
+    )
 
-                history.append(
-                    f"ASSISTANT SQL: "
-                    f"{message['sql']}"
-                )
+    return suggestions
 
-    return "\n\n".join(
-        history[-14:]
+
+def get_fallback_suggestions():
+
+    columns = list(
+        df.columns
+    )
+
+    numeric_columns = [
+        column
+        for column in columns
+        if pd.api.types.is_numeric_dtype(
+            df[column]
+        )
+    ]
+
+    text_columns = [
+        column
+        for column in columns
+        if (
+            pd.api.types.is_object_dtype(
+                df[column]
+            )
+            or pd.api.types.is_string_dtype(
+                df[column]
+            )
+        )
+    ]
+
+    datetime_columns = [
+        column
+        for column in columns
+        if pd.api.types.is_datetime64_any_dtype(
+            df[column]
+        )
+    ]
+
+    suggestions = []
+
+    # Ranking
+    if numeric_columns:
+
+        metric = numeric_columns[0]
+
+        suggestions.append(
+            f"What are the top 5 records by {metric}?"
+        )
+
+    # Filtering / lookup
+    if text_columns:
+
+        column = text_columns[0]
+
+        suggestions.append(
+            f"What different values appear in {column}?"
+        )
+
+    # Aggregation
+    if numeric_columns:
+
+        metric = numeric_columns[0]
+
+        suggestions.append(
+            f"What is the average {metric}?"
+        )
+
+    # Comparison
+    if (
+        text_columns
+        and numeric_columns
+    ):
+
+        group = text_columns[0]
+        metric = numeric_columns[0]
+
+        suggestions.append(
+            f"How does {metric} compare across {group}?"
+        )
+
+    # Distribution
+    if (
+        text_columns
+        and numeric_columns
+    ):
+
+        group = text_columns[0]
+        metric = numeric_columns[0]
+
+        suggestions.append(
+            f"What percentage of {metric} comes from each {group}?"
+        )
+
+    # Numeric relationship
+    if len(numeric_columns) >= 2:
+
+        first = numeric_columns[0]
+        second = numeric_columns[1]
+
+        suggestions.append(
+            f"Is there a relationship between {first} and {second}?"
+        )
+
+    # Time trend
+    if datetime_columns and numeric_columns:
+
+        date_column = datetime_columns[0]
+        metric = numeric_columns[0]
+
+        suggestions.append(
+            f"How has {metric} changed over time?"
+        )
+
+    elif len(columns) >= 2:
+
+        suggestions.append(
+            f"Show a detailed breakdown using {columns[0]} and {columns[1]}."
+        )
+
+    # Detailed exploration
+    if columns:
+
+        suggestions.append(
+            f"Show me 10 representative records with their {columns[0]} values."
+        )
+
+    return clean_suggestions(
+        suggestions,
+        max_items=8,
     )
 
 
+def ensure_suggestions():
+
+    if (
+        st.session_state.suggestions_file
+        == st.session_state.file_name
+        and st.session_state.suggestions
+    ):
+
+        return
+
+    with st.spinner(
+        "Creating questions for this file..."
+    ):
+
+        try:
+
+            suggestions = generate_suggestions()
+
+        except Exception:
+
+            suggestions = []
+
+        if len(suggestions) < 6:
+
+            fallback = get_fallback_suggestions()
+
+            combined = (
+                suggestions
+                + fallback
+            )
+
+            suggestions = clean_suggestions(
+                combined,
+                max_items=8,
+            )
+
+        st.session_state.suggestions = (
+            suggestions
+        )
+
+        st.session_state.suggestions_file = (
+            st.session_state.file_name
+        )
+
+
 # =========================================================
-# SQL GENERATION
+# DISPLAY SUGGESTIONS
+# =========================================================
+
+ensure_suggestions()
+
+
+if st.session_state.suggestions:
+
+    st.subheader(
+        "💡 Suggested questions"
+    )
+
+    st.caption(
+        "These questions are generated specifically "
+        "for your uploaded file."
+    )
+
+    suggestion_columns = st.columns(
+        2
+    )
+
+    for index, suggestion in enumerate(
+        st.session_state.suggestions
+    ):
+
+        column = suggestion_columns[
+            index % 2
+        ]
+
+        with column:
+
+            if st.button(
+                suggestion,
+                key=f"suggestion_{index}",
+                use_container_width=True,
+            ):
+
+                # IMPORTANT:
+                # Set the value BEFORE chat_input
+                # is instantiated on the next rerun.
+                st.session_state.question_input = (
+                    suggestion
+                )
+
+                st.rerun()
+
+
+# =========================================================
+# GENERATE SQL
 # =========================================================
 
 def generate_sql(question):
 
-    conversation_text = (
-        get_conversation_history()
-    )
+    conversation_text = ""
+
+    for message in st.session_state.messages:
+
+        if message["role"] == "user":
+
+            conversation_text += (
+                f"\nUSER:\n"
+                f"{message['content']}\n"
+            )
+
+        elif message["role"] == "assistant":
+
+            if "sql" in message:
+
+                conversation_text += (
+                    f"\nASSISTANT SQL:\n"
+                    f"{message['sql']}\n"
+                )
+
 
     system_prompt = f"""
 You are an expert data analyst.
 
-You answer questions about uploaded datasets
-using DuckDB SQL.
+You answer questions about a dataset using DuckDB SQL.
 
-AVAILABLE TABLES:
+TABLE:
+
+uploaded_data
+
+SCHEMA:
 
 {schema_text}
 
@@ -790,34 +1123,11 @@ CURRENT QUESTION:
 
 {question}
 
-Translate the user's natural-language
-question into one correct DuckDB SQL query.
-
-The user can ask follow-up questions.
-
-Resolve references such as:
-
-- it
-- that
-- those
-- them
-- same
-- previous
-- above
-- these
-- only those
-- now
-- instead
-- compare that
-- show me more
-
-using conversation history.
-
 RULES:
 
 1. Generate exactly ONE SQL query.
-2. Only SELECT or WITH queries.
-3. Never modify data.
+2. Only generate SELECT or WITH queries.
+3. Never modify the dataset.
 4. Never use INSERT.
 5. Never use UPDATE.
 6. Never use DELETE.
@@ -827,45 +1137,23 @@ RULES:
 10. Never use TRUNCATE.
 11. Never use MERGE.
 12. Never use REPLACE.
-13. Never use GRANT.
-14. Never use REVOKE.
-15. Never use ATTACH.
-16. Never use DETACH.
-17. Never use COPY.
-18. Never use EXPORT.
-19. Never use IMPORT.
-20. Use only existing tables.
-21. Use only existing columns.
-22. Use JOIN when required.
-23. Use GROUP BY when required.
-24. Use ORDER BY for rankings.
-25. Use LIMIT for top/bottom requests.
-26. Use SUM for totals.
-27. Use AVG for averages.
-28. Use COUNT for counts.
-29. Use COUNT(DISTINCT ...) for distinct counts.
-30. Use MIN and MAX when appropriate.
-31. Use CASE when required.
-32. Use NULLIF when required.
-33. For percentages, calculate from actual data.
-34. For comparisons, calculate relevant values.
-35. For trends, group dates appropriately.
-36. For time-series questions, order chronologically.
-37. For text comparisons, prefer LOWER().
-38. Do not assume capitalization.
-39. Do not invent values.
-40. Do not invent tables.
-41. Do not invent columns.
-42. For top N, return N rows.
-43. For "all", don't add LIMIT.
-44. Use readable aliases.
-45. Return ONLY SQL.
-46. No markdown.
-
-If the question cannot be answered using
-the uploaded data, return:
-
-CANNOT_ANSWER
+13. Use only columns that exist in the schema.
+14. The table name is uploaded_data.
+15. Use valid DuckDB SQL.
+16. Understand follow-up questions using conversation history.
+17. Resolve words like "those", "them", "same",
+    "India", "USA", etc. using previous context.
+18. When comparing text values, make comparisons
+    case-insensitive whenever appropriate.
+19. Do not assume the capitalization used by the user
+    exactly matches the capitalization in the dataset.
+20. If a text value is being filtered, use case-insensitive
+    matching when appropriate.
+21. Return ONLY SQL.
+22. Do not use markdown.
+23. Do not invent columns.
+24. If the question cannot be answered using the dataset,
+    return CANNOT_ANSWER.
 """
 
     response = client.chat.completions.create(
@@ -875,15 +1163,15 @@ CANNOT_ANSWER
         messages=[
             {
                 "role": "system",
-                "content": system_prompt
+                "content": system_prompt,
             },
             {
                 "role": "user",
-                "content": question
-            }
+                "content": question,
+            },
         ],
 
-        temperature=0
+        temperature=0,
     )
 
     return (
@@ -896,27 +1184,25 @@ CANNOT_ANSWER
 
 
 # =========================================================
-# SQL VALIDATION
+# VALIDATE SQL
 # =========================================================
 
 def validate_sql(sql):
-
-    if not sql:
-        return None
 
     sql = re.sub(
         r"```sql",
         "",
         sql,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
 
     sql = sql.replace(
         "```",
-        ""
+        "",
     ).strip()
 
-    if sql.upper() == "CANNOT_ANSWER":
+    if sql == "CANNOT_ANSWER":
+
         return None
 
     statements = [
@@ -936,7 +1222,7 @@ def validate_sql(sql):
     if not re.match(
         r"^(SELECT|WITH)\b",
         sql,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     ):
 
         raise ValueError(
@@ -959,7 +1245,7 @@ def validate_sql(sql):
         "DETACH",
         "COPY",
         "EXPORT",
-        "IMPORT"
+        "IMPORT",
     ]
 
     for word in forbidden_words:
@@ -967,7 +1253,7 @@ def validate_sql(sql):
         if re.search(
             rf"\b{word}\b",
             sql,
-            flags=re.IGNORECASE
+            flags=re.IGNORECASE,
         ):
 
             raise ValueError(
@@ -978,13 +1264,13 @@ def validate_sql(sql):
 
 
 # =========================================================
-# SQL FIX
+# FIX SQL
 # =========================================================
 
 def fix_sql(
     question,
     bad_sql,
-    error_message
+    error_message,
 ):
 
     prompt = f"""
@@ -994,32 +1280,31 @@ USER QUESTION:
 
 {question}
 
-INVALID SQL:
+BAD SQL:
 
 {bad_sql}
 
-DATABASE ERROR:
+DUCKDB ERROR:
 
 {error_message}
 
-AVAILABLE SCHEMA:
+DATASET SCHEMA:
 
 {schema_text}
 
-Fix the SQL query.
+Fix the SQL.
 
-Rules:
+RULES:
 
-1. Return exactly ONE query.
+1. Return exactly ONE SQL query.
 2. Only SELECT or WITH.
-3. Use only existing tables.
-4. Use only existing columns.
-5. Use valid DuckDB SQL.
-6. Use LOWER() for case-insensitive text matching.
-7. Do not modify data.
-8. Do not invent anything.
-9. Return ONLY SQL.
-10. No markdown.
+3. Never modify the dataset.
+4. Use only columns from the schema.
+5. Table name is uploaded_data.
+6. Use valid DuckDB SQL.
+7. Prefer case-insensitive text comparisons.
+8. Return ONLY SQL.
+9. No markdown.
 """
 
     response = client.chat.completions.create(
@@ -1029,11 +1314,11 @@ Rules:
         messages=[
             {
                 "role": "system",
-                "content": prompt
+                "content": prompt,
             }
         ],
 
-        temperature=0
+        temperature=0,
     )
 
     corrected_sql = (
@@ -1056,15 +1341,8 @@ Rules:
 def generate_answer(
     question,
     sql,
-    result
+    result,
 ):
-
-    if result.empty:
-
-        return (
-            "No matching data was found "
-            "in the uploaded data."
-        )
 
     result_for_llm = (
         result
@@ -1073,7 +1351,7 @@ def generate_answer(
     )
 
     prompt = f"""
-You are a senior data analyst.
+You are a helpful data analyst.
 
 USER QUESTION:
 
@@ -1083,27 +1361,21 @@ SQL:
 
 {sql}
 
-QUERY RESULT:
+RESULT:
 
 {result_for_llm}
 
-Answer the user's question using ONLY
-the query result.
+Answer the user's question using ONLY the result.
 
 Rules:
 
-1. Do not invent information.
+1. Be concise and clear.
 2. Mention important numbers.
-3. For rankings, clearly state the ranking.
-4. For comparisons, clearly compare values.
-5. For percentages, include percentages.
-6. For totals, clearly state the total.
-7. For averages, clearly state the average.
-8. For trends, explain the trend briefly.
-9. For lists, format them clearly.
-10. Keep the answer concise.
-11. Never show SQL.
-12. Never claim unsupported information.
+3. Do not invent information.
+4. Do not make unsupported claims.
+5. If there are multiple rows, summarize useful patterns.
+6. Do not show SQL.
+7. Do not mention that you are an AI.
 """
 
     response = client.chat.completions.create(
@@ -1113,11 +1385,11 @@ Rules:
         messages=[
             {
                 "role": "system",
-                "content": prompt
+                "content": prompt,
             }
         ],
 
-        temperature=0
+        temperature=0,
     )
 
     return (
@@ -1130,80 +1402,7 @@ Rules:
 
 
 # =========================================================
-# INSIGHT
-# =========================================================
-
-def generate_insight(
-    question,
-    result
-):
-
-    if result.empty:
-        return None
-
-    if len(result.columns) < 2:
-        return None
-
-    result_for_llm = (
-        result
-        .head(30)
-        .to_string(index=False)
-    )
-
-    prompt = f"""
-You are a senior business analyst.
-
-USER QUESTION:
-
-{question}
-
-RESULT:
-
-{result_for_llm}
-
-Give ONE useful analytical insight.
-
-Rules:
-
-- Use only the result.
-- Never invent information.
-- Prefer concrete numbers.
-- Mention largest or smallest values when relevant.
-- Mention a meaningful difference when relevant.
-- One or two sentences maximum.
-- Return NONE if there is no useful insight.
-"""
-
-    response = client.chat.completions.create(
-
-        model=MODEL,
-
-        messages=[
-            {
-                "role": "system",
-                "content": prompt
-            }
-        ],
-
-        temperature=0
-    )
-
-    insight = (
-        response
-        .choices[0]
-        .message
-        .content
-        .strip()
-    )
-
-    if insight.upper() == "NONE":
-        return None
-
-    return insight
-
-
-# =========================================================
-# CHART REQUEST
+# EXPLICIT CHART REQUEST
 # =========================================================
 
 def get_requested_chart(question):
@@ -1225,8 +1424,6 @@ def get_requested_chart(question):
     if (
         "bar chart" in q
         or "bar graph" in q
-        or "column chart" in q
-        or "column graph" in q
     ):
         return "bar"
 
@@ -1258,18 +1455,26 @@ def get_requested_chart(question):
 
 def detect_chart_type(
     question,
-    result
+    result,
 ):
 
     if result.empty:
         return None
 
-    requested = get_requested_chart(
-        question
+    requested_chart = (
+        get_requested_chart(
+            question
+        )
     )
 
-    if requested:
-        return requested
+    if requested_chart:
+        return requested_chart
+
+    if len(result.columns) < 2:
+        return None
+
+    if len(result) > 30:
+        return None
 
     if len(result.columns) != 2:
         return None
@@ -1277,21 +1482,16 @@ def detect_chart_type(
     first_column = result.columns[0]
     second_column = result.columns[1]
 
-    first_series = result[
-        first_column
-    ]
+    first_series = result[first_column]
+    second_series = result[second_column]
 
-    second_series = result[
-        second_column
-    ]
-
-    first_numeric = (
+    first_is_numeric = (
         pd.api.types.is_numeric_dtype(
             first_series
         )
     )
 
-    second_numeric = (
+    second_is_numeric = (
         pd.api.types.is_numeric_dtype(
             second_series
         )
@@ -1299,75 +1499,68 @@ def detect_chart_type(
 
     question_lower = question.lower()
 
-    # =====================================================
-    # DATE + NUMBER
-    # =====================================================
-
     if (
-        is_date_like(first_series)
-        and second_numeric
-    ):
-
-        return "line"
-
-    # =====================================================
-    # NUMBER + NUMBER
-    # =====================================================
-
-    if (
-        first_numeric
-        and second_numeric
+        first_is_numeric
+        and second_is_numeric
     ):
 
         if any(
             word in question_lower
             for word in [
-                "correlation",
                 "relationship",
+                "correlation",
                 "versus",
-                "compare",
-                " vs "
+                " vs ",
             ]
         ):
 
             return "scatter"
 
-    # =====================================================
-    # CATEGORY + NUMBER
-    # =====================================================
+    if (
+        pd.api.types.is_datetime64_any_dtype(
+            first_series
+        )
+    ):
+
+        return "line"
 
     if (
-        not first_numeric
-        and second_numeric
+        not first_is_numeric
+        and second_is_numeric
     ):
 
         if any(
             word in question_lower
             for word in [
+                "monthly",
+                "month",
+                "weekly",
+                "week",
+                "daily",
+                "day",
+                "yearly",
+                "year",
                 "trend",
                 "over time",
-                "monthly",
-                "weekly",
-                "daily",
-                "yearly",
-                "growth"
+                "growth",
             ]
         ):
 
             return "line"
 
-        if any(
-            word in question_lower
-            for word in [
-                "share",
-                "percentage",
-                "percent",
-                "proportion",
-                "distribution"
-            ]
-        ):
+        if len(result) <= 6:
 
-            if len(result) <= 8:
+            if any(
+                word in question_lower
+                for word in [
+                    "share",
+                    "percentage",
+                    "percent",
+                    "proportion",
+                    "distribution",
+                ]
+            ):
+
                 return "pie"
 
         return "bar"
@@ -1381,12 +1574,12 @@ def detect_chart_type(
 
 def show_chart(
     question,
-    result
+    result,
 ):
 
     chart_type = detect_chart_type(
         question,
-        result
+        result,
     )
 
     if chart_type is None:
@@ -1399,13 +1592,6 @@ def show_chart(
         return
 
     if len(result) > 30:
-
-        st.info(
-            "The result contains more than "
-            "30 rows, so the chart was hidden "
-            "for readability."
-        )
-
         return
 
     x_column = result.columns[0]
@@ -1415,9 +1601,10 @@ def show_chart(
         [x_column, y_column]
     ].copy()
 
-    # =====================================================
-    # PIE
-    # =====================================================
+    tooltip = [
+        x_column,
+        y_column,
+    ]
 
     if chart_type == "pie":
 
@@ -1427,17 +1614,14 @@ def show_chart(
             .encode(
                 theta=alt.Theta(
                     field=y_column,
-                    type="quantitative"
+                    type="quantitative",
                 ),
                 color=alt.Color(
                     field=x_column,
                     type="nominal",
-                    title=x_column
+                    title=x_column,
                 ),
-                tooltip=[
-                    x_column,
-                    y_column
-                ]
+                tooltip=tooltip,
             )
             .properties(
                 height=450
@@ -1446,12 +1630,8 @@ def show_chart(
 
         st.altair_chart(
             chart,
-            use_container_width=True
+            use_container_width=True,
         )
-
-    # =====================================================
-    # DONUT
-    # =====================================================
 
     elif chart_type == "donut":
 
@@ -1463,16 +1643,13 @@ def show_chart(
             .encode(
                 theta=alt.Theta(
                     field=y_column,
-                    type="quantitative"
+                    type="quantitative",
                 ),
                 color=alt.Color(
                     field=x_column,
-                    type="nominal"
+                    type="nominal",
                 ),
-                tooltip=[
-                    x_column,
-                    y_column
-                ]
+                tooltip=tooltip,
             )
             .properties(
                 height=450
@@ -1481,12 +1658,8 @@ def show_chart(
 
         st.altair_chart(
             chart,
-            use_container_width=True
+            use_container_width=True,
         )
-
-    # =====================================================
-    # BAR
-    # =====================================================
 
     elif chart_type == "bar":
 
@@ -1497,16 +1670,13 @@ def show_chart(
                 x=alt.X(
                     f"{x_column}:N",
                     sort="-y",
-                    title=x_column
+                    title=x_column,
                 ),
                 y=alt.Y(
                     f"{y_column}:Q",
-                    title=y_column
+                    title=y_column,
                 ),
-                tooltip=[
-                    x_column,
-                    y_column
-                ]
+                tooltip=tooltip,
             )
             .properties(
                 height=450
@@ -1515,50 +1685,26 @@ def show_chart(
 
         st.altair_chart(
             chart,
-            use_container_width=True
+            use_container_width=True,
         )
-
-    # =====================================================
-    # LINE
-    # =====================================================
 
     elif chart_type == "line":
 
-        line_data = chart_data.copy()
-
-        if not pd.api.types.is_datetime64_any_dtype(
-            line_data[x_column]
-        ):
-
-            converted = pd.to_datetime(
-                line_data[x_column],
-                errors="coerce"
-            )
-
-            if converted.notna().all():
-
-                line_data[x_column] = (
-                    converted
-                )
-
         chart = (
-            alt.Chart(line_data)
+            alt.Chart(chart_data)
             .mark_line(
                 point=True
             )
             .encode(
                 x=alt.X(
                     f"{x_column}:T",
-                    title=x_column
+                    title=x_column,
                 ),
                 y=alt.Y(
                     f"{y_column}:Q",
-                    title=y_column
+                    title=y_column,
                 ),
-                tooltip=[
-                    x_column,
-                    y_column
-                ]
+                tooltip=tooltip,
             )
             .properties(
                 height=450
@@ -1567,50 +1713,26 @@ def show_chart(
 
         st.altair_chart(
             chart,
-            use_container_width=True
+            use_container_width=True,
         )
-
-    # =====================================================
-    # AREA
-    # =====================================================
 
     elif chart_type == "area":
 
-        area_data = chart_data.copy()
-
-        if not pd.api.types.is_datetime64_any_dtype(
-            area_data[x_column]
-        ):
-
-            converted = pd.to_datetime(
-                area_data[x_column],
-                errors="coerce"
-            )
-
-            if converted.notna().all():
-
-                area_data[x_column] = (
-                    converted
-                )
-
         chart = (
-            alt.Chart(area_data)
+            alt.Chart(chart_data)
             .mark_area(
                 line=True
             )
             .encode(
                 x=alt.X(
                     f"{x_column}:T",
-                    title=x_column
+                    title=x_column,
                 ),
                 y=alt.Y(
                     f"{y_column}:Q",
-                    title=y_column
+                    title=y_column,
                 ),
-                tooltip=[
-                    x_column,
-                    y_column
-                ]
+                tooltip=tooltip,
             )
             .properties(
                 height=450
@@ -1619,12 +1741,8 @@ def show_chart(
 
         st.altair_chart(
             chart,
-            use_container_width=True
+            use_container_width=True,
         )
-
-    # =====================================================
-    # SCATTER
-    # =====================================================
 
     elif chart_type == "scatter":
 
@@ -1636,16 +1754,13 @@ def show_chart(
             .encode(
                 x=alt.X(
                     f"{x_column}:Q",
-                    title=x_column
+                    title=x_column,
                 ),
                 y=alt.Y(
                     f"{y_column}:Q",
-                    title=y_column
+                    title=y_column,
                 ),
-                tooltip=[
-                    x_column,
-                    y_column
-                ]
+                tooltip=tooltip,
             )
             .properties(
                 height=450
@@ -1654,191 +1769,12 @@ def show_chart(
 
         st.altair_chart(
             chart,
-            use_container_width=True
+            use_container_width=True,
         )
 
 
 # =========================================================
-# RESULT SUMMARY
-# =========================================================
-
-def show_result_summary(result):
-
-    if result is None:
-        return
-
-    if result.empty:
-        return
-
-    numeric_columns = []
-
-    for column in result.columns:
-
-        if pd.api.types.is_numeric_dtype(
-            result[column]
-        ):
-
-            numeric_columns.append(
-                column
-            )
-
-    if not numeric_columns:
-        return
-
-    if len(result) != 1:
-        return
-
-    columns = numeric_columns[:4]
-
-    metric_columns = st.columns(
-        len(columns)
-    )
-
-    for metric_column, column in zip(
-        metric_columns,
-        columns
-    ):
-
-        value = result[column].iloc[0]
-
-        if pd.isna(value):
-            continue
-
-        try:
-
-            formatted = (
-                f"{float(value):,.2f}"
-            )
-
-        except Exception:
-
-            formatted = str(value)
-
-        metric_column.metric(
-            label=column,
-            value=formatted
-        )
-
-
-# =========================================================
-# DOWNLOAD BUTTONS
-# =========================================================
-
-def show_download_buttons(result):
-
-    if result is None:
-        return
-
-    if result.empty:
-        return
-
-    col1, col2 = st.columns(2)
-
-    csv_data = result.to_csv(
-        index=False
-    )
-
-    with col1:
-
-        st.download_button(
-            label="⬇️ Download CSV",
-            data=csv_data,
-            file_name="query_result.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
-
-    excel_buffer = io.BytesIO()
-
-    with pd.ExcelWriter(
-        excel_buffer,
-        engine="openpyxl"
-    ) as writer:
-
-        result.to_excel(
-            writer,
-            index=False,
-            sheet_name="Results"
-        )
-
-    with col2:
-
-        st.download_button(
-            label="⬇️ Download Excel",
-            data=excel_buffer.getvalue(),
-            file_name="query_result.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-"
-                "officedocument.spreadsheetml.sheet"
-            ),
-            use_container_width=True
-        )
-
-
-# =========================================================
-# DISPLAY ASSISTANT MESSAGE
-# =========================================================
-
-def display_assistant_message(message):
-
-    if "answer" in message:
-
-        st.write(
-            message["answer"]
-        )
-
-    if message.get("insight"):
-
-        st.info(
-            f"💡 {message['insight']}"
-        )
-
-    if "sql" in message:
-
-        with st.expander(
-            "🔍 View generated SQL"
-        ):
-
-            st.code(
-                message["sql"],
-                language="sql"
-            )
-
-    if "data" in message:
-
-        result = message["data"]
-
-        if not result.empty:
-
-            show_result_summary(
-                result
-            )
-
-            st.dataframe(
-                result,
-                use_container_width=True
-            )
-
-            show_download_buttons(
-                result
-            )
-
-            if "question" in message:
-
-                show_chart(
-                    message["question"],
-                    result
-                )
-
-    if "error" in message:
-
-        st.error(
-            message["error"]
-        )
-
-
-# =========================================================
-# CHAT HISTORY
+# DISPLAY CHAT HISTORY
 # =========================================================
 
 for message in st.session_state.messages:
@@ -1853,57 +1789,67 @@ for message in st.session_state.messages:
                 message["content"]
             )
 
-        else:
+        elif message["role"] == "assistant":
 
-            display_assistant_message(
-                message
-            )
+            if "answer" in message:
+
+                st.write(
+                    message["answer"]
+                )
+
+            if "sql" in message:
+
+                with st.expander(
+                    "🔍 View generated SQL"
+                ):
+
+                    st.code(
+                        message["sql"],
+                        language="sql",
+                    )
+
+            if "data" in message:
+
+                st.dataframe(
+                    message["data"],
+                    use_container_width=True,
+                )
+
+            if "error" in message:
+
+                st.error(
+                    message["error"]
+                )
 
 
 # =========================================================
-# QUESTION INPUT
+# CHAT INPUT
 # =========================================================
 
-st.markdown(
-    "### 💬 Ask your question"
+question = st.chat_input(
+    "Ask a question about your data...",
+    key="question_input",
 )
-
-with st.form(
-    "question_form",
-    clear_on_submit=True
-):
-
-    question = st.text_input(
-        "Question",
-        key="question_input",
-        placeholder=(
-            "Ask anything about your uploaded data..."
-        ),
-        label_visibility="collapsed"
-    )
-
-    submitted = st.form_submit_button(
-        "Ask",
-        use_container_width=True
-    )
 
 
 # =========================================================
 # PROCESS QUESTION
 # =========================================================
 
-if submitted and question.strip():
+if question:
 
-    question = question.strip()
+    # Clear the populated suggestion value
+    # so the next interaction starts cleanly.
+    st.session_state.question_input = ""
 
     # -----------------------------------------------------
-    # User message
+    # USER MESSAGE
     # -----------------------------------------------------
 
     st.session_state.messages.append(
         {
             "role": "user",
-            "content": question
+            "content": question,
         }
     )
 
@@ -1913,11 +1859,14 @@ if submitted and question.strip():
             question
         )
 
+
     # -----------------------------------------------------
-    # Assistant
+    # ASSISTANT
     # -----------------------------------------------------
 
-    with st.chat_message("assistant"):
+    with st.chat_message(
+        "assistant"
+    ):
 
         try:
 
@@ -1938,15 +1887,11 @@ if submitted and question.strip():
                 )
 
 
-            # =============================================
-            # CANNOT ANSWER
-            # =============================================
-
             if sql is None:
 
                 answer = (
                     "I can't answer that using "
-                    "the uploaded data."
+                    "the uploaded dataset."
                 )
 
                 st.warning(
@@ -1957,7 +1902,6 @@ if submitted and question.strip():
                     {
                         "role": "assistant",
                         "answer": answer,
-                        "question": question
                     }
                 )
 
@@ -1974,9 +1918,11 @@ if submitted and question.strip():
                     "Analyzing your data..."
                 ):
 
-                    result = conn.execute(
-                        sql
-                    ).df()
+                    result = (
+                        conn
+                        .execute(sql)
+                        .df()
+                    )
 
             except Exception as first_error:
 
@@ -1987,14 +1933,7 @@ if submitted and question.strip():
                     corrected_sql = fix_sql(
                         question,
                         sql,
-                        str(first_error)
-                    )
-
-                if corrected_sql is None:
-
-                    raise RuntimeError(
-                        "The generated SQL "
-                        "could not be corrected."
+                        str(first_error),
                     )
 
                 try:
@@ -2003,34 +1942,35 @@ if submitted and question.strip():
                         "Running corrected query..."
                     ):
 
-                        result = conn.execute(
-                            corrected_sql
-                        ).df()
+                        result = (
+                            conn
+                            .execute(
+                                corrected_sql
+                            )
+                            .df()
+                        )
 
                     sql = corrected_sql
 
                 except Exception as second_error:
 
                     raise RuntimeError(
-                        "The query could not be "
-                        "executed after correction.\n\n"
-                        f"Database error: "
+                        "I couldn't run the generated "
+                        "query. Database error: "
                         f"{second_error}"
                     )
 
 
             # =============================================
-            # ANSWER
+            # NATURAL LANGUAGE ANSWER
             # =============================================
 
             if result.empty:
 
                 answer = (
                     "No matching data was found "
-                    "in the uploaded data."
+                    "in the uploaded file."
                 )
-
-                insight = None
 
             else:
 
@@ -2041,49 +1981,12 @@ if submitted and question.strip():
                     answer = generate_answer(
                         question,
                         sql,
-                        result
+                        result,
                     )
 
-                insight = None
-
-                if len(result) >= 2:
-
-                    with st.spinner(
-                        "Finding an insight..."
-                    ):
-
-                        insight = generate_insight(
-                            question,
-                            result
-                        )
-
-
-            # =============================================
-            # DISPLAY ANSWER
-            # =============================================
 
             st.write(
                 answer
-            )
-
-
-            # =============================================
-            # DISPLAY INSIGHT
-            # =============================================
-
-            if insight:
-
-                st.info(
-                    f"💡 {insight}"
-                )
-
-
-            # =============================================
-            # KPI
-            # =============================================
-
-            show_result_summary(
-                result
             )
 
 
@@ -2097,30 +2000,18 @@ if submitted and question.strip():
 
                 st.code(
                     sql,
-                    language="sql"
+                    language="sql",
                 )
 
 
             # =============================================
-            # DATA
+            # RESULT
             # =============================================
 
-            if result.empty:
-
-                st.warning(
-                    "The query returned no rows."
-                )
-
-            else:
-
-                st.dataframe(
-                    result,
-                    use_container_width=True
-                )
-
-                show_download_buttons(
-                    result
-                )
+            st.dataframe(
+                result,
+                use_container_width=True,
+            )
 
 
             # =============================================
@@ -2129,7 +2020,7 @@ if submitted and question.strip():
 
             show_chart(
                 question,
-                result
+                result,
             )
 
 
@@ -2141,27 +2032,21 @@ if submitted and question.strip():
                 {
                     "role": "assistant",
                     "answer": answer,
-                    "insight": insight,
                     "sql": sql,
                     "data": result,
-                    "question": question
                 }
             )
 
 
         except Exception as e:
 
-            error_message = str(e)
-
             st.error(
-                f"Something went wrong: "
-                f"{error_message}"
+                f"Something went wrong: {e}"
             )
 
             st.session_state.messages.append(
                 {
                     "role": "assistant",
-                    "error": error_message,
-                    "question": question
+                    "error": str(e),
                 }
             )
