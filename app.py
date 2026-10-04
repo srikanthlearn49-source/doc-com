@@ -210,8 +210,11 @@ RULES:
     column = 'value'.
 19. Do not assume the capitalization used by the user
     exactly matches the capitalization in the dataset.
-20. Return ONLY SQL.
-21. Do not use markdown.
+20. If a text value is being filtered, use the actual
+    dataset value when possible. Case-insensitive matching
+    is preferred.
+21. Return ONLY SQL.
+22. Do not use markdown.
 
 If the question cannot be answered using the dataset,
 return:
@@ -349,6 +352,39 @@ Rules:
     return response.choices[0].message.content.strip()
 
 # =========================================================
+# EXPLICIT CHART REQUEST
+# =========================================================
+
+def get_requested_chart(question):
+
+    q = question.lower()
+
+    if "pie chart" in q or "pie graph" in q:
+        return "pie"
+
+    if "donut chart" in q or "doughnut chart" in q:
+        return "donut"
+
+    if "bar chart" in q or "bar graph" in q:
+        return "bar"
+
+    if "line chart" in q or "line graph" in q:
+        return "line"
+
+    if "area chart" in q or "area graph" in q:
+        return "area"
+
+    if (
+        "scatter plot" in q
+        or "scatter chart" in q
+        or "scatter graph" in q
+    ):
+        return "scatter"
+
+    return None
+
+
+# =========================================================
 # CHART TYPE DETECTION
 # =========================================================
 
@@ -357,10 +393,17 @@ def detect_chart_type(question, result):
     if result.empty:
         return None
 
+    # User explicitly requested a chart
+    requested_chart = get_requested_chart(question)
+
+    if requested_chart:
+        return requested_chart
+
     if len(result.columns) < 2:
         return None
 
     question_lower = question.lower()
+
 
     # -----------------------------------------------------
     # Explicit chart requests
@@ -400,15 +443,15 @@ def detect_chart_type(question, result):
     first_column = result.columns[0]
     second_column = result.columns[1]
 
-    first_type = result[first_column].dtype
-    second_type = result[second_column].dtype
+    first_series = result[first_column]
+    second_series = result[second_column]
 
     first_is_numeric = pd.api.types.is_numeric_dtype(
-        first_type
+        first_series
     )
 
     second_is_numeric = pd.api.types.is_numeric_dtype(
-        second_type
+        second_series
     )
 
     # -----------------------------------------------------
@@ -432,7 +475,7 @@ def detect_chart_type(question, result):
     # -----------------------------------------------------
 
     if pd.api.types.is_datetime64_any_dtype(
-        result[first_column]
+        result[first_series]
     ):
 
         return "line"
@@ -835,14 +878,17 @@ if question:
             # Generate answer
             # ---------------------------------------------
 
-            with st.spinner("Preparing the answer..."):
-
-                answer = generate_answer(
-                    question,
-                    sql,
-                    result
+            if result.empty:
+                answer = (
+                     "No matching data was found in the uploaded file."
                 )
-
+            else:
+                with st.spinner("Preparing the answer..."):
+                    answer = generate_answer(
+                        question,
+                        sql,
+                        result
+                    )
 
             # ---------------------------------------------
             # Display answer
