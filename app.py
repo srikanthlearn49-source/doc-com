@@ -3,6 +3,8 @@ import pandas as pd
 import duckdb
 from groq import Groq
 import re
+import altair as alt
+
 
 
 # =========================================================
@@ -347,43 +349,362 @@ Rules:
     return response.choices[0].message.content.strip()
 
 # =========================================================
-# CHART
+# CHART TYPE DETECTION
 # =========================================================
 
-def show_chart(result):
+def detect_chart_type(question, result):
 
     if result.empty:
-        return
+        return None
 
-    # Only create charts for simple 2-column results
+    if len(result.columns) < 2:
+        return None
+
+    question_lower = question.lower()
+
+    # -----------------------------------------------------
+    # Explicit chart requests
+    # -----------------------------------------------------
+
+    if "pie chart" in question_lower:
+        return "pie"
+
+    if "donut chart" in question_lower:
+        return "donut"
+
+    if "bar chart" in question_lower:
+        return "bar"
+
+    if "column chart" in question_lower:
+        return "bar"
+
+    if "line chart" in question_lower:
+        return "line"
+
+    if "area chart" in question_lower:
+        return "area"
+
+    if "scatter plot" in question_lower:
+        return "scatter"
+
+    if "scatter chart" in question_lower:
+        return "scatter"
+
+    # -----------------------------------------------------
+    # Automatic chart selection
+    # -----------------------------------------------------
+
     if len(result.columns) != 2:
-        return
+        return None
 
     first_column = result.columns[0]
     second_column = result.columns[1]
 
-    # Check whether second column is numeric
-    if not pd.api.types.is_numeric_dtype(
-        result[second_column]
+    first_type = result[first_column].dtype
+    second_type = result[second_column].dtype
+
+    first_is_numeric = pd.api.types.is_numeric_dtype(
+        first_type
+    )
+
+    second_is_numeric = pd.api.types.is_numeric_dtype(
+        second_type
+    )
+
+    # -----------------------------------------------------
+    # Numeric vs numeric → scatter
+    # -----------------------------------------------------
+
+    if first_is_numeric and second_is_numeric:
+
+        if any(word in question_lower for word in [
+            "relationship",
+            "correlation",
+            "vs",
+            "versus",
+            "compare"
+        ]):
+
+            return "scatter"
+
+    # -----------------------------------------------------
+    # Date/time result → line
+    # -----------------------------------------------------
+
+    if pd.api.types.is_datetime64_any_dtype(
+        result[first_column]
     ):
+
+        return "line"
+
+    # -----------------------------------------------------
+    # Text + number
+    # -----------------------------------------------------
+
+    if not first_is_numeric and second_is_numeric:
+
+        # Time-related questions → line
+        if any(word in question_lower for word in [
+            "monthly",
+            "month",
+            "weekly",
+            "week",
+            "daily",
+            "day",
+            "yearly",
+            "year",
+            "over time",
+            "trend",
+            "growth"
+        ]):
+
+            return "line"
+
+        # Small number of categories → pie
+        if len(result) <= 6:
+
+            if any(word in question_lower for word in [
+                "share",
+                "percentage",
+                "percent",
+                "proportion",
+                "distribution"
+            ]):
+
+                return "pie"
+
+        # Default categorical result → bar
+        return "bar"
+
+    return None
+
+
+# =========================================================
+# SHOW CHART
+# =========================================================
+
+def show_chart(question, result):
+
+    chart_type = detect_chart_type(
+        question,
+        result
+    )
+
+    if chart_type is None:
         return
 
-    # Avoid huge charts
-    if len(result) > 20:
+    if result.empty:
         return
+
+    if len(result.columns) < 2:
+        return
+
+    # Keep charts readable
+    if len(result) > 30:
+        return
+
+    x_column = result.columns[0]
+    y_column = result.columns[1]
 
     chart_data = result[
-        [first_column, second_column]
+        [x_column, y_column]
     ].copy()
 
-    chart_data = chart_data.set_index(
-        first_column
-    )
+    # =====================================================
+    # PIE
+    # =====================================================
 
-    st.bar_chart(
-        chart_data
-    )
+    if chart_type == "pie":
 
+        chart = alt.Chart(chart_data).mark_arc().encode(
+
+            theta=alt.Theta(
+                field=y_column,
+                type="quantitative"
+            ),
+
+            color=alt.Color(
+                field=x_column,
+                type="nominal",
+                title=x_column
+            ),
+
+            tooltip=[
+                x_column,
+                y_column
+            ]
+        ).properties(
+            height=450
+        )
+
+        st.altair_chart(
+            chart,
+            use_container_width=True
+        )
+
+    # =====================================================
+    # DONUT
+    # =====================================================
+
+    elif chart_type == "donut":
+
+        chart = alt.Chart(chart_data).mark_arc(
+            innerRadius=80
+        ).encode(
+
+            theta=alt.Theta(
+                field=y_column,
+                type="quantitative"
+            ),
+
+            color=alt.Color(
+                field=x_column,
+                type="nominal"
+            ),
+
+            tooltip=[
+                x_column,
+                y_column
+            ]
+        ).properties(
+            height=450
+        )
+
+        st.altair_chart(
+            chart,
+            use_container_width=True
+        )
+
+    # =====================================================
+    # BAR
+    # =====================================================
+
+    elif chart_type == "bar":
+
+        chart = alt.Chart(chart_data).mark_bar().encode(
+
+            x=alt.X(
+                f"{x_column}:N",
+                sort="-y",
+                title=x_column
+            ),
+
+            y=alt.Y(
+                f"{y_column}:Q",
+                title=y_column
+            ),
+
+            tooltip=[
+                x_column,
+                y_column
+            ]
+        ).properties(
+            height=450
+        )
+
+        st.altair_chart(
+            chart,
+            use_container_width=True
+        )
+
+    # =====================================================
+    # LINE
+    # =====================================================
+
+    elif chart_type == "line":
+
+        chart = alt.Chart(chart_data).mark_line(
+            point=True
+        ).encode(
+
+            x=alt.X(
+                f"{x_column}:T",
+                title=x_column
+            ),
+
+            y=alt.Y(
+                f"{y_column}:Q",
+                title=y_column
+            ),
+
+            tooltip=[
+                x_column,
+                y_column
+            ]
+        ).properties(
+            height=450
+        )
+
+        st.altair_chart(
+            chart,
+            use_container_width=True
+        )
+
+    # =====================================================
+    # AREA
+    # =====================================================
+
+    elif chart_type == "area":
+
+        chart = alt.Chart(chart_data).mark_area(
+            line=True
+        ).encode(
+
+            x=alt.X(
+                f"{x_column}:T",
+                title=x_column
+            ),
+
+            y=alt.Y(
+                f"{y_column}:Q",
+                title=y_column
+            ),
+
+            tooltip=[
+                x_column,
+                y_column
+            ]
+        ).properties(
+            height=450
+        )
+
+        st.altair_chart(
+            chart,
+            use_container_width=True
+        )
+
+    # =====================================================
+    # SCATTER
+    # =====================================================
+
+    elif chart_type == "scatter":
+
+        chart = alt.Chart(chart_data).mark_circle(
+            size=100
+        ).encode(
+
+            x=alt.X(
+                f"{x_column}:Q",
+                title=x_column
+            ),
+
+            y=alt.Y(
+                f"{y_column}:Q",
+                title=y_column
+            ),
+
+            tooltip=[
+                x_column,
+                y_column
+            ]
+        ).properties(
+            height=450
+        )
+
+        st.altair_chart(
+            chart,
+            use_container_width=True
+        )
 
 
 # =========================================================
@@ -555,7 +876,7 @@ if question:
             # Chart
             # ---------------------------------------------
 
-            show_chart(result)
+            show_chart(question,result)
             
 
 
