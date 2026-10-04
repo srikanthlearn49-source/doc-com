@@ -53,6 +53,9 @@ if "table_names" not in st.session_state:
 if "uploaded_files" not in st.session_state:
     st.session_state.uploaded_files = []
 
+if "question_input" not in st.session_state:
+    st.session_state.question_input = ""
+
 
 # =========================================================
 # SAFE TABLE NAME
@@ -116,6 +119,214 @@ def get_file_signature(files):
 
 
 # =========================================================
+# FILE-SPECIFIC SUGGESTED QUESTIONS
+# =========================================================
+
+def generate_suggested_questions(
+    sheets
+):
+
+    questions = []
+
+    for table_name, df in sheets.items():
+
+        if df.empty:
+            continue
+
+        columns = list(df.columns)
+
+        numeric_columns = []
+
+        text_columns = []
+
+        date_columns = []
+
+        for column in columns:
+
+            series = df[column]
+
+            if pd.api.types.is_numeric_dtype(
+                series
+            ):
+
+                numeric_columns.append(
+                    column
+                )
+
+            elif is_date_like(series):
+
+                date_columns.append(
+                    column
+                )
+
+            else:
+
+                text_columns.append(
+                    column
+                )
+
+        # -------------------------------------------------
+        # Numeric questions
+        # -------------------------------------------------
+
+        for column in numeric_columns[:3]:
+
+            questions.append(
+                f"What is the average {column}?"
+            )
+
+            questions.append(
+                f"What is the highest {column}?"
+            )
+
+            questions.append(
+                f"Show the top 5 records by {column}."
+            )
+
+        # -------------------------------------------------
+        # Category questions
+        # -------------------------------------------------
+
+        for column in text_columns[:3]:
+
+            questions.append(
+                f"Show the number of records by {column}."
+            )
+
+            questions.append(
+                f"Which {column} has the most records?"
+            )
+
+        # -------------------------------------------------
+        # Category + numeric
+        # -------------------------------------------------
+
+        if text_columns and numeric_columns:
+
+            category = text_columns[0]
+            numeric = numeric_columns[0]
+
+            questions.append(
+                f"Show the average {numeric} by {category}."
+            )
+
+            questions.append(
+                f"Compare {numeric} by {category}."
+            )
+
+            questions.append(
+                f"Show the percentage share by {category}."
+            )
+
+        # -------------------------------------------------
+        # Two numeric columns
+        # -------------------------------------------------
+
+        if len(numeric_columns) >= 2:
+
+            first_numeric = numeric_columns[0]
+            second_numeric = numeric_columns[1]
+
+            questions.append(
+                f"Compare {first_numeric} and "
+                f"{second_numeric}."
+            )
+
+            questions.append(
+                f"Show the relationship between "
+                f"{first_numeric} and {second_numeric}."
+            )
+
+        # -------------------------------------------------
+        # Date + numeric
+        # -------------------------------------------------
+
+        if date_columns and numeric_columns:
+
+            date_column = date_columns[0]
+            numeric_column = numeric_columns[0]
+
+            questions.append(
+                f"Show the {numeric_column} trend over time."
+            )
+
+            questions.append(
+                f"Show {numeric_column} by "
+                f"{date_column}."
+            )
+
+        # -------------------------------------------------
+        # Dataset-wide questions
+        # -------------------------------------------------
+
+        questions.append(
+            "How many records are in the dataset?"
+        )
+
+        questions.append(
+            "Show me a summary of the dataset."
+        )
+
+        # -------------------------------------------------
+        # Remove duplicates
+        # -------------------------------------------------
+
+        unique_questions = []
+
+        for question in questions:
+
+            if question not in unique_questions:
+
+                unique_questions.append(
+                    question
+                )
+
+        return unique_questions[:10]
+
+    return []
+
+
+# =========================================================
+# DATE DETECTION
+# =========================================================
+
+def is_date_like(series):
+
+    if pd.api.types.is_datetime64_any_dtype(
+        series
+    ):
+
+        return True
+
+    if not (
+        pd.api.types.is_object_dtype(series)
+        or pd.api.types.is_string_dtype(series)
+    ):
+
+        return False
+
+    sample = (
+        series
+        .dropna()
+        .astype(str)
+        .head(50)
+    )
+
+    if sample.empty:
+        return False
+
+    converted = pd.to_datetime(
+        sample,
+        errors="coerce"
+    )
+
+    return (
+        converted.notna().mean()
+        >= 0.8
+    )
+
+
+# =========================================================
 # FILE UPLOAD
 # =========================================================
 
@@ -159,9 +370,9 @@ if (
 
             file_name = uploaded_file.name
 
-            # =================================================
+            # =============================================
             # CSV
-            # =================================================
+            # =============================================
 
             if file_name.lower().endswith(".csv"):
 
@@ -190,9 +401,9 @@ if (
                     table_name
                 )
 
-            # =================================================
+            # =============================================
             # EXCEL
-            # =================================================
+            # =============================================
 
             else:
 
@@ -252,7 +463,11 @@ if (
             for file in uploaded_files
         ]
 
+        # New file = new conversation
         st.session_state.messages = []
+
+        # Clear previous suggested question
+        st.session_state.question_input = ""
 
     except Exception as e:
 
@@ -305,6 +520,17 @@ st.success(
 
 
 # =========================================================
+# GENERATE FILE-SPECIFIC QUESTIONS
+# =========================================================
+
+suggested_questions = (
+    generate_suggested_questions(
+        st.session_state.sheets
+    )
+)
+
+
+# =========================================================
 # SIDEBAR
 # =========================================================
 
@@ -332,27 +558,46 @@ with st.sidebar:
 
     st.divider()
 
+    # =====================================================
+    # FILE-SPECIFIC QUESTIONS
+    # =====================================================
+
     st.header("💡 Suggested questions")
 
-    suggestions = [
-        "What are the top 5 products by sales?",
-        "Which category has the highest sales?",
-        "Show sales by category.",
-        "What is the average sales value?",
-        "Which brand has the most products?",
-        "Show the sales trend over time.",
-        "Which products are responsible for most sales?",
-        "Compare sales between categories.",
-        "Show me the percentage share by category.",
-    ]
-
-    for suggestion in suggestions:
+    if suggested_questions:
 
         st.caption(
-            f"• {suggestion}"
+            "Click a question to put it in the "
+            "question box."
+        )
+
+        for index, suggestion in enumerate(
+            suggested_questions
+        ):
+
+            if st.button(
+                suggestion,
+                key=f"suggestion_{index}",
+                use_container_width=True
+            ):
+
+                st.session_state.question_input = (
+                    suggestion
+                )
+
+                st.rerun()
+
+    else:
+
+        st.caption(
+            "No suggestions available for this file."
         )
 
     st.divider()
+
+    # =====================================================
+    # CLEAR CONVERSATION
+    # =====================================================
 
     if st.button(
         "🗑️ Clear conversation",
@@ -360,6 +605,8 @@ with st.sidebar:
     ):
 
         st.session_state.messages = []
+
+        st.session_state.question_input = ""
 
         st.rerun()
 
@@ -426,7 +673,9 @@ with st.expander(
                         series.isna().sum()
                     ),
                     "Unique": int(
-                        series.nunique(dropna=True)
+                        series.nunique(
+                            dropna=True
+                        )
                     )
                 }
             )
@@ -1098,44 +1347,6 @@ def get_requested_chart(question):
 
 
 # =========================================================
-# DATE DETECTION
-# =========================================================
-
-def is_date_like(series):
-
-    if pd.api.types.is_datetime64_any_dtype(
-        series
-    ):
-        return True
-
-    if not (
-        pd.api.types.is_object_dtype(series)
-        or pd.api.types.is_string_dtype(series)
-    ):
-        return False
-
-    sample = (
-        series
-        .dropna()
-        .astype(str)
-        .head(50)
-    )
-
-    if sample.empty:
-        return False
-
-    converted = pd.to_datetime(
-        sample,
-        errors="coerce"
-    )
-
-    return (
-        converted.notna().mean()
-        >= 0.8
-    )
-
-
-# =========================================================
 # CHART DETECTION
 # =========================================================
 
@@ -1542,47 +1753,7 @@ def show_chart(
 
 
 # =========================================================
-# KPI
-# =========================================================
-
-def show_kpis(result):
-
-    if result.empty:
-        return
-
-    if len(result.columns) != 1:
-        return
-
-    column = result.columns[0]
-
-    series = result[column]
-
-    if not pd.api.types.is_numeric_dtype(
-        series
-    ):
-        return
-
-    value = series.iloc[0]
-
-    if pd.isna(value):
-        return
-
-    try:
-
-        formatted = f"{float(value):,.2f}"
-
-    except Exception:
-
-        formatted = str(value)
-
-    st.metric(
-        label=column,
-        value=formatted
-    )
-
-
-# =========================================================
-# AUTOMATIC KPI SUMMARY
+# RESULT SUMMARY
 # =========================================================
 
 def show_result_summary(result):
@@ -1781,19 +1952,43 @@ for message in st.session_state.messages:
 
 
 # =========================================================
-# CHAT INPUT
+# QUESTION INPUT
 # =========================================================
 
-question = st.chat_input(
-    "Ask a question about your data..."
-)
+st.markdown("### 💬 Ask your question")
+
+
+with st.form(
+    "question_form",
+    clear_on_submit=False
+):
+
+    question = st.text_input(
+        "Question",
+        key="question_input",
+        placeholder=(
+            "Ask anything about your uploaded data..."
+        ),
+        label_visibility="collapsed"
+    )
+
+    submitted = st.form_submit_button(
+        "Ask",
+        use_container_width=True
+    )
 
 
 # =========================================================
 # PROCESS QUESTION
 # =========================================================
 
-if question:
+if submitted and question.strip():
+
+    question = question.strip()
+
+    # -----------------------------------------------------
+    # User message
+    # -----------------------------------------------------
 
     st.session_state.messages.append(
         {
@@ -1802,9 +1997,18 @@ if question:
         }
     )
 
+    # Clear input after submitting
+    st.session_state.question_input = ""
+
     with st.chat_message("user"):
 
-        st.write(question)
+        st.write(
+            question
+        )
+
+    # -----------------------------------------------------
+    # Assistant
+    # -----------------------------------------------------
 
     with st.chat_message("assistant"):
 
@@ -2023,7 +2227,7 @@ if question:
 
 
             # =============================================
-            # SAVE
+            # SAVE MESSAGE
             # =============================================
 
             st.session_state.messages.append(
