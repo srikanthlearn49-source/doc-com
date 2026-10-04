@@ -242,7 +242,6 @@ CANNOT_ANSWER
 
     return response.choices[0].message.content.strip()
 
-
 # =========================================================
 # VALIDATE SQL
 # =========================================================
@@ -261,14 +260,41 @@ def validate_sql(sql):
     if sql == "CANNOT_ANSWER":
         return None
 
+    # -----------------------------------------------------
+    # Only one SQL statement
+    # -----------------------------------------------------
+
+    statements = [
+        statement.strip()
+        for statement in sql.split(";")
+        if statement.strip()
+    ]
+
+    if len(statements) != 1:
+
+        raise ValueError(
+            "Only one SQL statement is allowed."
+        )
+
+    sql = statements[0]
+
+    # -----------------------------------------------------
+    # Only SELECT / WITH
+    # -----------------------------------------------------
+
     if not re.match(
         r"^(SELECT|WITH)\b",
         sql,
         flags=re.IGNORECASE
     ):
+
         raise ValueError(
-            "Only SELECT queries are allowed."
+            "Only SELECT or WITH queries are allowed."
         )
+
+    # -----------------------------------------------------
+    # Forbidden SQL
+    # -----------------------------------------------------
 
     forbidden_words = [
         "INSERT",
@@ -279,7 +305,14 @@ def validate_sql(sql):
         "CREATE",
         "TRUNCATE",
         "MERGE",
-        "REPLACE"
+        "REPLACE",
+        "GRANT",
+        "REVOKE",
+        "ATTACH",
+        "DETACH",
+        "COPY",
+        "EXPORT",
+        "IMPORT"
     ]
 
     for word in forbidden_words:
@@ -295,6 +328,73 @@ def validate_sql(sql):
             )
 
     return sql
+
+# =========================================================
+# FIX SQL
+# =========================================================
+
+def fix_sql(question, bad_sql, error_message):
+
+    prompt = f"""
+You are an expert DuckDB SQL debugger.
+
+The user asked:
+
+{question}
+
+The SQL generated was:
+
+{bad_sql}
+
+DuckDB returned this error:
+
+{error_message}
+
+The dataset schema is:
+
+{schema_text}
+
+Fix the SQL query.
+
+RULES:
+
+1. Return exactly ONE SQL query.
+2. Only generate SELECT or WITH queries.
+3. Never use INSERT.
+4. Never use UPDATE.
+5. Never use DELETE.
+6. Never use DROP.
+7. Never use ALTER.
+8. Never use CREATE.
+9. Never use TRUNCATE.
+10. Never use MERGE.
+11. Never use REPLACE.
+12. Use only columns that exist in the schema.
+13. The table name is uploaded_data.
+14. Use valid DuckDB SQL.
+15. If comparing text values, prefer case-insensitive
+    comparisons using LOWER().
+16. Return ONLY the corrected SQL.
+17. Do not use markdown code fences.
+"""
+
+    response = client.chat.completions.create(
+
+        model=MODEL,
+
+        messages=[
+            {
+                "role": "system",
+                "content": prompt
+            }
+        ],
+
+        temperature=0
+    )
+
+    corrected_sql = response.choices[0].message.content.strip()
+
+    return validate_sql(corrected_sql)
 
 
 # =========================================================
@@ -872,7 +972,39 @@ if question:
             with st.spinner("Analyzing your data..."):
 
                 result = conn.execute(sql).df()
+                
+            except Exception as first_error:
 
+                # -------------------------------------------------
+                # SQL failed 
+                # -------------------------------------------------
+                with st.spinner("Fixing the query..."):
+
+                    corrected_sql = fix_sql(
+                        question,
+                        sql,
+                        str(first_error)
+                    )
+
+                # -------------------------------------------------
+                # Try corrected SQL
+                # -------------------------------------------------
+                try:
+
+                    with st.spinner("Running corrected query..."):
+
+                        result = conn.execute{
+                            corrected_sql
+                        }.df()
+
+                    # Use corrected SQL from now on
+                    sql = corrected_sql
+                except Exception as second_error:
+
+                    raise RuntimeError(
+                        "I couldn't run the generated query. "
+                        f"Database error: {second_error}"
+                    )
 
             # ---------------------------------------------
             # Generate answer
