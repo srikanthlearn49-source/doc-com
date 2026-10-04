@@ -16,6 +16,7 @@ st.set_page_config(
 )
 
 st.title("📊 Chat With Your Data")
+st.caption("Ask questions about your CSV or Excel data.")
 
 
 # =========================================================
@@ -61,7 +62,7 @@ if uploaded_file is None:
 
 
 # =========================================================
-# READ NEW FILE
+# READ FILE
 # =========================================================
 
 if st.session_state.file_name != uploaded_file.name:
@@ -77,7 +78,7 @@ if st.session_state.file_name != uploaded_file.name:
         st.session_state.df = df
         st.session_state.file_name = uploaded_file.name
 
-        # New file = new conversation
+        # Reset chat for a new file
         st.session_state.messages = []
 
     except Exception as e:
@@ -140,10 +141,6 @@ schema_text = "\n".join(
 
 def generate_sql(question):
 
-    # ---------------------------------------------
-    # Build conversation context
-    # ---------------------------------------------
-
     conversation_text = ""
 
     for message in st.session_state.messages:
@@ -164,10 +161,6 @@ def generate_sql(question):
                 )
 
 
-    # ---------------------------------------------
-    # System prompt
-    # ---------------------------------------------
-
     system_prompt = f"""
 You are an expert data analyst.
 
@@ -185,11 +178,11 @@ CONVERSATION HISTORY:
 
 {conversation_text}
 
-CURRENT USER QUESTION:
+CURRENT QUESTION:
 
 {question}
 
-IMPORTANT RULES:
+RULES:
 
 1. Generate exactly ONE SQL query.
 2. Only generate SELECT or WITH queries.
@@ -206,22 +199,17 @@ IMPORTANT RULES:
 13. Use only columns that exist in the schema.
 14. The table name is uploaded_data.
 15. Use valid DuckDB SQL.
-16. Understand follow-up questions using the conversation history.
-17. If the user says things like "those", "them", "same",
-    "only India", etc., resolve the meaning using the
-    previous conversation.
+16. Understand follow-up questions using conversation history.
+17. Resolve words like "those", "them", "same",
+    "India", "USA", etc. using previous context.
 18. Return ONLY SQL.
-19. Do not use markdown code fences.
+19. Do not use markdown.
 
-If the question cannot be answered from the dataset,
-return exactly:
+If the question cannot be answered using the dataset,
+return:
 
 CANNOT_ANSWER
 """
-
-    # ---------------------------------------------
-    # Ask Groq
-    # ---------------------------------------------
 
     response = client.chat.completions.create(
 
@@ -290,6 +278,7 @@ def validate_sql(sql):
             sql,
             flags=re.IGNORECASE
         ):
+
             raise ValueError(
                 f"Unsafe SQL detected: {word}"
             )
@@ -298,7 +287,62 @@ def validate_sql(sql):
 
 
 # =========================================================
-# DISPLAY PREVIOUS CONVERSATION
+# GENERATE NATURAL LANGUAGE ANSWER
+# =========================================================
+
+def generate_answer(question, sql, result):
+
+    # Limit result sent back to LLM
+    result_for_llm = result.head(100).to_string(
+        index=False
+    )
+
+    prompt = f"""
+You are a helpful data analyst.
+
+The user asked:
+
+{question}
+
+The SQL query used was:
+
+{sql}
+
+The query returned:
+
+{result_for_llm}
+
+Answer the user's question using the query result.
+
+Rules:
+
+1. Be concise and clear.
+2. Mention the important numbers.
+3. Do not invent information.
+4. Do not claim anything that isn't supported by the result.
+5. If there are multiple rows, summarize the important pattern.
+6. Do not show SQL in your answer.
+"""
+
+    response = client.chat.completions.create(
+
+        model=MODEL,
+
+        messages=[
+            {
+                "role": "system",
+                "content": prompt
+            }
+        ],
+
+        temperature=0
+    )
+
+    return response.choices[0].message.content.strip()
+
+
+# =========================================================
+# DISPLAY CHAT HISTORY
 # =========================================================
 
 for message in st.session_state.messages:
@@ -311,24 +355,33 @@ for message in st.session_state.messages:
 
         elif message["role"] == "assistant":
 
+            # Natural-language answer
+            if "answer" in message:
+
+                st.write(message["answer"])
+
+
+            # SQL
             if "sql" in message:
 
-                st.write("**Generated SQL**")
+                with st.expander("🔍 View generated SQL"):
 
-                st.code(
-                    message["sql"],
-                    language="sql"
-                )
+                    st.code(
+                        message["sql"],
+                        language="sql"
+                    )
 
+
+            # Data
             if "data" in message:
-
-                st.write("**Result**")
 
                 st.dataframe(
                     message["data"],
                     use_container_width=True
                 )
 
+
+            # Error
             if "error" in message:
 
                 st.error(message["error"])
@@ -349,9 +402,9 @@ question = st.chat_input(
 
 if question:
 
-    # ---------------------------------------------
-    # Save user message
-    # ---------------------------------------------
+    # -----------------------------------------------------
+    # User message
+    # -----------------------------------------------------
 
     st.session_state.messages.append(
         {
@@ -365,15 +418,19 @@ if question:
         st.write(question)
 
 
-    # ---------------------------------------------
+    # -----------------------------------------------------
     # Assistant
-    # ---------------------------------------------
+    # -----------------------------------------------------
 
     with st.chat_message("assistant"):
 
         try:
 
-            with st.spinner("Generating SQL..."):
+            # ---------------------------------------------
+            # Generate SQL
+            # ---------------------------------------------
+
+            with st.spinner("Understanding your question..."):
 
                 raw_sql = generate_sql(question)
 
@@ -392,62 +449,72 @@ if question:
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
-                        "error": answer
+                        "answer": answer
                     }
                 )
 
                 st.stop()
 
 
-            # -----------------------------------------
+            # ---------------------------------------------
             # Execute SQL
-            # -----------------------------------------
+            # ---------------------------------------------
 
-            with st.spinner("Running query..."):
+            with st.spinner("Analyzing your data..."):
 
                 result = conn.execute(sql).df()
 
 
-            # -----------------------------------------
-            # Display SQL
-            # -----------------------------------------
+            # ---------------------------------------------
+            # Generate answer
+            # ---------------------------------------------
 
-            st.write("### Generated SQL")
+            with st.spinner("Preparing the answer..."):
 
-            st.code(
-                sql,
-                language="sql"
+                answer = generate_answer(
+                    question,
+                    sql,
+                    result
+                )
+
+
+            # ---------------------------------------------
+            # Display answer
+            # ---------------------------------------------
+
+            st.write(answer)
+
+
+            # ---------------------------------------------
+            # SQL
+            # ---------------------------------------------
+
+            with st.expander("🔍 View generated SQL"):
+
+                st.code(
+                    sql,
+                    language="sql"
+                )
+
+
+            # ---------------------------------------------
+            # Result
+            # ---------------------------------------------
+
+            st.dataframe(
+                result,
+                use_container_width=True
             )
 
 
-            # -----------------------------------------
-            # Display result
-            # -----------------------------------------
-
-            st.write("### Result")
-
-            if result.empty:
-
-                st.info(
-                    "The query ran successfully, "
-                    "but returned no rows."
-                )
-
-            else:
-
-                st.dataframe(
-                    result,
-                    use_container_width=True
-                )
-
-
-            # -----------------------------------------
-            # Save assistant message
-            # -----------------------------------------
+            # ---------------------------------------------
+            # Save message
+            # ---------------------------------------------
 
             st.session_state.messages.append(
                 {
                     "role": "assistant",
+                    "answer": answer,
                     "sql": sql,
                     "data": result
                 }
