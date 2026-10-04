@@ -346,6 +346,45 @@ Rules:
 
     return response.choices[0].message.content.strip()
 
+# =========================================================
+# CHART
+# =========================================================
+
+def show_chart(result):
+
+    if result.empty:
+        return
+
+    # Only create charts for simple 2-column results
+    if len(result.columns) != 2:
+        return
+
+    first_column = result.columns[0]
+    second_column = result.columns[1]
+
+    # Check whether second column is numeric
+    if not pd.api.types.is_numeric_dtype(
+        result[second_column]
+    ):
+        return
+
+    # Avoid huge charts
+    if len(result) > 20:
+        return
+
+    chart_data = result[
+        [first_column, second_column]
+    ].copy()
+
+    chart_data = chart_data.set_index(
+        first_column
+    )
+
+    st.bar_chart(
+        chart_data
+    )
+
+
 
 # =========================================================
 # DISPLAY CHAT HISTORY
@@ -511,6 +550,13 @@ if question:
                 result,
                 use_container_width=True
             )
+
+            # ---------------------------------------------
+            # Chart
+            # ---------------------------------------------
+
+            show_chart(result)
+            
 
 
             # ---------------------------------------------
