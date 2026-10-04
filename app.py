@@ -58,6 +58,41 @@ if "question_input" not in st.session_state:
 
 
 # =========================================================
+# HELPER - DATE DETECTION
+# =========================================================
+
+def is_date_like(series):
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+
+    if not (
+        pd.api.types.is_object_dtype(series)
+        or pd.api.types.is_string_dtype(series)
+    ):
+        return False
+
+    sample = (
+        series
+        .dropna()
+        .astype(str)
+        .head(50)
+    )
+
+    if sample.empty:
+        return False
+
+    converted = pd.to_datetime(
+        sample,
+        errors="coerce"
+    )
+
+    return (
+        converted.notna().mean() >= 0.8
+    )
+
+
+# =========================================================
 # SAFE TABLE NAME
 # =========================================================
 
@@ -136,40 +171,30 @@ def generate_suggested_questions(
         columns = list(df.columns)
 
         numeric_columns = []
-
         text_columns = []
-
         date_columns = []
 
         for column in columns:
 
             series = df[column]
 
-            if pd.api.types.is_numeric_dtype(
-                series
-            ):
+            if pd.api.types.is_numeric_dtype(series):
 
-                numeric_columns.append(
-                    column
-                )
+                numeric_columns.append(column)
 
             elif is_date_like(series):
 
-                date_columns.append(
-                    column
-                )
+                date_columns.append(column)
 
             else:
 
-                text_columns.append(
-                    column
-                )
+                text_columns.append(column)
 
-        # -------------------------------------------------
-        # Numeric questions
-        # -------------------------------------------------
+        # =================================================
+        # NUMERIC COLUMNS
+        # =================================================
 
-        for column in numeric_columns[:3]:
+        for column in numeric_columns[:4]:
 
             questions.append(
                 f"What is the average {column}?"
@@ -180,14 +205,14 @@ def generate_suggested_questions(
             )
 
             questions.append(
-                f"Show the top 5 records by {column}."
+                f"What is the lowest {column}?"
             )
 
-        # -------------------------------------------------
-        # Category questions
-        # -------------------------------------------------
+        # =================================================
+        # TEXT / CATEGORY COLUMNS
+        # =================================================
 
-        for column in text_columns[:3]:
+        for column in text_columns[:4]:
 
             questions.append(
                 f"Show the number of records by {column}."
@@ -197,9 +222,9 @@ def generate_suggested_questions(
                 f"Which {column} has the most records?"
             )
 
-        # -------------------------------------------------
-        # Category + numeric
-        # -------------------------------------------------
+        # =================================================
+        # CATEGORY + NUMERIC
+        # =================================================
 
         if text_columns and numeric_columns:
 
@@ -215,12 +240,17 @@ def generate_suggested_questions(
             )
 
             questions.append(
+                f"Show the top 5 {category} values "
+                f"by average {numeric}."
+            )
+
+            questions.append(
                 f"Show the percentage share by {category}."
             )
 
-        # -------------------------------------------------
-        # Two numeric columns
-        # -------------------------------------------------
+        # =================================================
+        # MULTIPLE NUMERIC COLUMNS
+        # =================================================
 
         if len(numeric_columns) >= 2:
 
@@ -232,14 +262,9 @@ def generate_suggested_questions(
                 f"{second_numeric}."
             )
 
-            questions.append(
-                f"Show the relationship between "
-                f"{first_numeric} and {second_numeric}."
-            )
-
-        # -------------------------------------------------
-        # Date + numeric
-        # -------------------------------------------------
+        # =================================================
+        # DATE + NUMERIC
+        # =================================================
 
         if date_columns and numeric_columns:
 
@@ -255,9 +280,9 @@ def generate_suggested_questions(
                 f"{date_column}."
             )
 
-        # -------------------------------------------------
-        # Dataset-wide questions
-        # -------------------------------------------------
+        # =================================================
+        # GENERAL QUESTIONS
+        # =================================================
 
         questions.append(
             "How many records are in the dataset?"
@@ -267,9 +292,9 @@ def generate_suggested_questions(
             "Show me a summary of the dataset."
         )
 
-        # -------------------------------------------------
-        # Remove duplicates
-        # -------------------------------------------------
+        # =================================================
+        # REMOVE DUPLICATES
+        # =================================================
 
         unique_questions = []
 
@@ -281,49 +306,9 @@ def generate_suggested_questions(
                     question
                 )
 
-        return unique_questions[:10]
+        return unique_questions[:12]
 
     return []
-
-
-# =========================================================
-# DATE DETECTION
-# =========================================================
-
-def is_date_like(series):
-
-    if pd.api.types.is_datetime64_any_dtype(
-        series
-    ):
-
-        return True
-
-    if not (
-        pd.api.types.is_object_dtype(series)
-        or pd.api.types.is_string_dtype(series)
-    ):
-
-        return False
-
-    sample = (
-        series
-        .dropna()
-        .astype(str)
-        .head(50)
-    )
-
-    if sample.empty:
-        return False
-
-    converted = pd.to_datetime(
-        sample,
-        errors="coerce"
-    )
-
-    return (
-        converted.notna().mean()
-        >= 0.8
-    )
 
 
 # =========================================================
@@ -466,7 +451,7 @@ if (
         # New file = new conversation
         st.session_state.messages = []
 
-        # Clear previous suggested question
+        # Clear question
         st.session_state.question_input = ""
 
     except Exception as e:
@@ -485,7 +470,6 @@ if (
 conn = duckdb.connect(
     ":memory:"
 )
-
 
 for table_name, df in (
     st.session_state.sheets.items()
@@ -511,7 +495,6 @@ total_columns = sum(
     for df in st.session_state.sheets.values()
 )
 
-
 st.success(
     f"Loaded {len(st.session_state.sheets)} table(s) • "
     f"{total_rows:,} total rows • "
@@ -520,7 +503,7 @@ st.success(
 
 
 # =========================================================
-# GENERATE FILE-SPECIFIC QUESTIONS
+# SUGGESTED QUESTIONS
 # =========================================================
 
 suggested_questions = (
@@ -528,6 +511,15 @@ suggested_questions = (
         st.session_state.sheets
     )
 )
+
+
+# =========================================================
+# QUESTION CALLBACK
+# =========================================================
+
+def select_suggestion(question):
+
+    st.session_state.question_input = question
 
 
 # =========================================================
@@ -558,34 +550,26 @@ with st.sidebar:
 
     st.divider()
 
-    # =====================================================
-    # FILE-SPECIFIC QUESTIONS
-    # =====================================================
-
     st.header("💡 Suggested questions")
 
     if suggested_questions:
 
         st.caption(
-            "Click a question to put it in the "
-            "question box."
+            "Click a question to put it into "
+            "the question box."
         )
 
         for index, suggestion in enumerate(
             suggested_questions
         ):
 
-            if st.button(
+            st.button(
                 suggestion,
                 key=f"suggestion_{index}",
-                use_container_width=True
-            ):
-
-                st.session_state.question_input = (
-                    suggestion
-                )
-
-                st.rerun()
+                use_container_width=True,
+                on_click=select_suggestion,
+                args=(suggestion,)
+            )
 
     else:
 
@@ -594,10 +578,6 @@ with st.sidebar:
         )
 
     st.divider()
-
-    # =====================================================
-    # CLEAR CONVERSATION
-    # =====================================================
 
     if st.button(
         "🗑️ Clear conversation",
@@ -740,7 +720,6 @@ Columns:
 """
     )
 
-
 schema_text = "\n".join(
     schema_parts
 )
@@ -811,7 +790,7 @@ CURRENT QUESTION:
 
 {question}
 
-Your job is to translate the user's natural-language
+Translate the user's natural-language
 question into one correct DuckDB SQL query.
 
 The user can ask follow-up questions.
@@ -832,106 +811,56 @@ Resolve references such as:
 - compare that
 - show me more
 
-using the conversation history.
+using conversation history.
 
 RULES:
 
 1. Generate exactly ONE SQL query.
-
 2. Only SELECT or WITH queries.
-
 3. Never modify data.
-
 4. Never use INSERT.
-
 5. Never use UPDATE.
-
 6. Never use DELETE.
-
 7. Never use DROP.
-
 8. Never use ALTER.
-
 9. Never use CREATE.
-
 10. Never use TRUNCATE.
-
 11. Never use MERGE.
-
 12. Never use REPLACE.
-
 13. Never use GRANT.
-
 14. Never use REVOKE.
-
 15. Never use ATTACH.
-
 16. Never use DETACH.
-
 17. Never use COPY.
-
 18. Never use EXPORT.
-
 19. Never use IMPORT.
-
 20. Use only existing tables.
-
 21. Use only existing columns.
-
 22. Use JOIN when required.
-
 23. Use GROUP BY when required.
-
 24. Use ORDER BY for rankings.
-
 25. Use LIMIT for top/bottom requests.
-
 26. Use SUM for totals.
-
 27. Use AVG for averages.
-
 28. Use COUNT for counts.
-
 29. Use COUNT(DISTINCT ...) for distinct counts.
-
 30. Use MIN and MAX when appropriate.
-
 31. Use CASE when required.
-
-32. Use NULLIF when required to avoid division by zero.
-
-33. For percentages, calculate the percentage
-    from actual dataset values.
-
-34. For comparisons, calculate the relevant
-    difference or percentage difference.
-
-35. For trends, group dates into useful periods.
-
+32. Use NULLIF when required.
+33. For percentages, calculate from actual data.
+34. For comparisons, calculate relevant values.
+35. For trends, group dates appropriately.
 36. For time-series questions, order chronologically.
-
 37. For text comparisons, prefer LOWER().
-
 38. Do not assume capitalization.
-
 39. Do not invent values.
-
 40. Do not invent tables.
-
 41. Do not invent columns.
-
-42. If the user asks for "top N", return N rows
-    unless ties are explicitly requested.
-
-43. If the user asks for "all", don't add LIMIT.
-
-44. Return useful column aliases.
-
-45. For aggregated results, use readable aliases.
-
-46. Return ONLY SQL.
-
-47. No markdown.
+42. For top N, return N rows.
+43. For "all", don't add LIMIT.
+44. Use readable aliases.
+45. Return ONLY SQL.
+46. No markdown.
 
 If the question cannot be answered using
 the uploaded data, return:
@@ -1082,24 +1011,14 @@ Fix the SQL query.
 Rules:
 
 1. Return exactly ONE query.
-
 2. Only SELECT or WITH.
-
 3. Use only existing tables.
-
 4. Use only existing columns.
-
 5. Use valid DuckDB SQL.
-
-6. Use LOWER() for case-insensitive
-   text matching when appropriate.
-
+6. Use LOWER() for case-insensitive text matching.
 7. Do not modify data.
-
 8. Do not invent anything.
-
 9. Return ONLY SQL.
-
 10. No markdown.
 """
 
@@ -1174,29 +1093,17 @@ the query result.
 Rules:
 
 1. Do not invent information.
-
 2. Mention important numbers.
-
 3. For rankings, clearly state the ranking.
-
 4. For comparisons, clearly compare values.
-
 5. For percentages, include percentages.
-
 6. For totals, clearly state the total.
-
 7. For averages, clearly state the average.
-
 8. For trends, explain the trend briefly.
-
 9. For lists, format them clearly.
-
 10. Keep the answer concise.
-
 11. Never show SQL.
-
-12. Never claim information not supported
-    by the result.
+12. Never claim unsupported information.
 """
 
     response = client.chat.completions.create(
@@ -1223,7 +1130,7 @@ Rules:
 
 
 # =========================================================
-# INSIGHT GENERATION
+# INSIGHT
 # =========================================================
 
 def generate_insight(
@@ -1261,8 +1168,7 @@ Rules:
 - Use only the result.
 - Never invent information.
 - Prefer concrete numbers.
-- Mention the largest or smallest value
-  when relevant.
+- Mention largest or smallest values when relevant.
 - Mention a meaningful difference when relevant.
 - One or two sentences maximum.
 - Return NONE if there is no useful insight.
@@ -1758,6 +1664,9 @@ def show_chart(
 
 def show_result_summary(result):
 
+    if result is None:
+        return
+
     if result.empty:
         return
 
@@ -1776,7 +1685,7 @@ def show_result_summary(result):
     if not numeric_columns:
         return
 
-    if len(result) > 1:
+    if len(result) != 1:
         return
 
     columns = numeric_columns[:4]
@@ -1812,7 +1721,7 @@ def show_result_summary(result):
 
 
 # =========================================================
-# DOWNLOADS
+# DOWNLOAD BUTTONS
 # =========================================================
 
 def show_download_buttons(result):
@@ -1955,12 +1864,13 @@ for message in st.session_state.messages:
 # QUESTION INPUT
 # =========================================================
 
-st.markdown("### 💬 Ask your question")
-
+st.markdown(
+    "### 💬 Ask your question"
+)
 
 with st.form(
     "question_form",
-    clear_on_submit=False
+    clear_on_submit=True
 ):
 
     question = st.text_input(
@@ -1996,9 +1906,6 @@ if submitted and question.strip():
             "content": question
         }
     )
-
-    # Clear input after submitting
-    st.session_state.question_input = ""
 
     with st.chat_message("user"):
 
@@ -2152,7 +2059,7 @@ if submitted and question.strip():
 
 
             # =============================================
-            # ANSWER
+            # DISPLAY ANSWER
             # =============================================
 
             st.write(
@@ -2161,7 +2068,7 @@ if submitted and question.strip():
 
 
             # =============================================
-            # INSIGHT
+            # DISPLAY INSIGHT
             # =============================================
 
             if insight:
